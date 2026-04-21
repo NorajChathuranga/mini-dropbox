@@ -32,6 +32,7 @@ Choose **SERVER** or **CLIENT** mode when the app starts.
 - Enter the password
 - Click **CONNECT**
 - Use `https://` address (example: `https://192.168.x.x:5000`)
+- Or pick the server automatically from **Discovered Servers** (mDNS/Bonjour)
 
 ### 4. Client Mode — Dashboard
 | Feature | How |
@@ -57,4 +58,5 @@ Choose **SERVER** or **CLIENT** mode when the app starts.
 - HTTPS is enabled using a self-signed certificate generated on first start
 - The certificate/key are stored in `./certs/`
 - Passwords are stored as bcrypt hashes in memory (never plaintext)
+- LAN auto-discovery uses Zeroconf (mDNS/Bonjour) service `_droplink._tcp.local.`
 - The `synced/` folder is created next to `app.py` by default

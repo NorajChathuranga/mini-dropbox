@@ -14,6 +14,7 @@ from typing import Optional
 
 import bcrypt
 import uvicorn
+from zeroconf import IPVersion, ServiceBrowser, ServiceInfo, ServiceListener, Zeroconf
 
 # ── FastAPI (server side) ──────────────────────────────────────────────────────
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -31,7 +32,8 @@ from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QProgressBar, QFileDialog, QMessageBox, QFrame, QHeaderView,
     QStackedWidget, QAbstractItemView, QTextEdit, QSplitter,
-    QScrollArea, QSizePolicy, QSpacerItem, QDialog, QDialogButtonBox
+    QScrollArea, QSizePolicy, QSpacerItem, QDialog, QDialogButtonBox,
+    QComboBox
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QSize, QByteArray, QSettings
@@ -78,6 +80,31 @@ QLineEdit {{
 QLineEdit::placeholder {{ color: {C['dim']}; }}
 QLineEdit:read-only {{ background: {C['panel']}; color: {C['text']}; }}
 QLineEdit:focus {{ border-color: {C['accent']}; }}
+
+QComboBox {{
+    background: {C['card']};
+    border: 1px solid {C['border']};
+    border-radius: 6px;
+    color: {C['text']};
+    padding: 8px 12px;
+    font-size: 12px;
+}}
+QComboBox:focus {{ border-color: {C['accent']}; }}
+QComboBox::drop-down {{
+    border: none;
+    width: 22px;
+}}
+QComboBox::down-arrow {{
+    image: none;
+    width: 0;
+}}
+QComboBox QAbstractItemView {{
+    background: {C['panel']};
+    border: 1px solid {C['border']};
+    color: {C['text']};
+    selection-background-color: {C['hover']};
+    selection-color: {C['text']};
+}}
 
 QPushButton {{
     background: {C['card']};
@@ -298,6 +325,16 @@ def _verify_password(password: str, password_hash: bytes) -> bool:
 TLS_DIR = Path("certs")
 TLS_CERT_FILE = TLS_DIR / "droplink-cert.pem"
 TLS_KEY_FILE = TLS_DIR / "droplink-key.pem"
+
+DISCOVERY_SERVICE_TYPE = "_droplink._tcp.local."
+
+
+def _cert_fingerprint_sha256(cert_file: Path) -> str:
+    try:
+        cert = x509.load_pem_x509_certificate(cert_file.read_bytes())
+        return cert.fingerprint(hashes.SHA256()).hex()
+    except Exception:
+        return ""
 
 
 def _ensure_self_signed_cert(cert_file: Path, key_file: Path):
@@ -560,6 +597,129 @@ def _api_request(method, url, **kwargs):
         kwargs.setdefault("verify", False)
     return _req.request(method, url, **kwargs)
 
+
+class ZeroconfAdvertiser:
+    def __init__(self, *, local_ip: str, port: int, fingerprint: str):
+        self.local_ip = local_ip
+        self.port = port
+        self.fingerprint = fingerprint
+        self._zeroconf = None
+        self._service_info = None
+
+    def start(self):
+        host = socket.gethostname() or "droplink"
+        service_name = f"Droplink-{host}-{self.port}.{DISCOVERY_SERVICE_TYPE}"
+        properties = {
+            "name": host,
+            "proto": "https",
+            "ver": "2",
+            "fp": self.fingerprint,
+        }
+        encoded_props = {k.encode("utf-8"): v.encode("utf-8") for k, v in properties.items()}
+        self._service_info = ServiceInfo(
+            type_=DISCOVERY_SERVICE_TYPE,
+            name=service_name,
+            addresses=[socket.inet_aton(self.local_ip)],
+            port=self.port,
+            properties=encoded_props,
+            server=f"{host}.local.",
+        )
+        self._zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
+        self._zeroconf.register_service(self._service_info)
+
+    def stop(self):
+        try:
+            if self._zeroconf and self._service_info:
+                self._zeroconf.unregister_service(self._service_info)
+        except Exception:
+            pass
+        try:
+            if self._zeroconf:
+                self._zeroconf.close()
+        except Exception:
+            pass
+        self._service_info = None
+        self._zeroconf = None
+
+
+class _DiscoveryListener(ServiceListener):
+    def __init__(self, owner):
+        self.owner = owner
+
+    def add_service(self, zc, type_, name):
+        self.owner._emit_service(name)
+
+    def update_service(self, zc, type_, name):
+        self.owner._emit_service(name)
+
+    def remove_service(self, zc, type_, name):
+        self.owner.service_remove.emit(name)
+
+
+class DiscoveryBrowserThread(QThread):
+    service_upsert = pyqtSignal(object)
+    service_remove = pyqtSignal(str)
+    status = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._running = True
+        self._zeroconf = None
+        self._browser = None
+
+    def run(self):
+        self._running = True
+        try:
+            self._zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
+            listener = _DiscoveryListener(self)
+            self._browser = ServiceBrowser(self._zeroconf, DISCOVERY_SERVICE_TYPE, listener)
+            self.status.emit("Scanning LAN for Droplink servers...")
+            while self._running:
+                self.msleep(200)
+        except Exception as e:
+            self.status.emit(f"Discovery unavailable: {e}")
+        finally:
+            try:
+                if self._browser:
+                    self._browser.cancel()
+            except Exception:
+                pass
+            try:
+                if self._zeroconf:
+                    self._zeroconf.close()
+            except Exception:
+                pass
+            self._browser = None
+            self._zeroconf = None
+
+    def stop(self):
+        self._running = False
+
+    def _emit_service(self, service_name: str):
+        if not self._zeroconf:
+            return
+        info = self._zeroconf.get_service_info(DISCOVERY_SERVICE_TYPE, service_name, timeout=2000)
+        if not info or not info.addresses:
+            return
+        ip = socket.inet_ntoa(info.addresses[0])
+        props = {}
+        for k, v in (info.properties or {}).items():
+            key = k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k)
+            val = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
+            props[key] = val
+
+        proto = props.get("proto", "https")
+        url = f"{proto}://{ip}:{info.port}"
+        display = f"{props.get('name', 'Droplink')} ({ip}:{info.port})"
+        self.service_upsert.emit(
+            {
+                "id": service_name,
+                "display": display,
+                "url": url,
+                "fingerprint": props.get("fp", ""),
+            }
+        )
+
 class UploadWorker(QThread):
     progress = pyqtSignal(int)
     done = pyqtSignal(bool, str)
@@ -753,6 +913,7 @@ class ServerWidget(QWidget):
     def __init__(self):
         super().__init__()
         self._server_thread = None
+        self._discovery_advertiser = None
         self._running = False
         self._folder_btn = None
         self._workers = []
@@ -985,6 +1146,18 @@ class ServerWidget(QWidget):
         self._start_btn.hide()
         self._stop_btn.setEnabled(True)
         self._stop_btn.show()
+
+        try:
+            self._discovery_advertiser = ZeroconfAdvertiser(
+                local_ip=ip,
+                port=port,
+                fingerprint=_cert_fingerprint_sha256(TLS_CERT_FILE),
+            )
+            self._discovery_advertiser.start()
+            self._append_log("📡  mDNS discovery enabled (_droplink._tcp.local)")
+        except Exception as e:
+            self._append_log(f"⚠  mDNS discovery unavailable: {e}")
+
         self._append_log(f"🚀  Server started on port {port}")
         self._append_log(f"🔒  HTTPS enabled (self-signed): {TLS_CERT_FILE.resolve()}")
         self._append_log(f"📁  Sync folder: {SYNC_FOLDER.resolve()}")
@@ -996,6 +1169,11 @@ class ServerWidget(QWidget):
 
     def _on_server_stopped(self):
         self._running = False
+
+        if self._discovery_advertiser:
+            self._discovery_advertiser.stop()
+            self._discovery_advertiser = None
+
         self._set_status("● OFFLINE", C["danger"])
         self._set_server_controls(True)
         self._start_btn.setEnabled(True)
@@ -1138,6 +1316,8 @@ class ClientLoginWidget(QWidget):
     def __init__(self):
         super().__init__()
         self._settings = QSettings("Droplink", "DroplinkApp")
+        self._discovery_thread = None
+        self._discovered_services = {}
         root = QVBoxLayout(self)
         root.setSpacing(0); root.setContentsMargins(0,0,0,0)
 
@@ -1147,7 +1327,7 @@ class ClientLoginWidget(QWidget):
         bl = QHBoxLayout(bar); bl.setContentsMargins(20,0,20,0)
         back = QPushButton("← BACK"); back.setFixedSize(90,32)
         back.setObjectName("btn_subtle")
-        back.clicked.connect(self.go_back)
+        back.clicked.connect(self._go_back)
         bl.addWidget(back)
         bl.addWidget(label("CLIENT MODE",
             f"font-size:13px;font-weight:bold;color:{C['accent']};letter-spacing:3px;"))
@@ -1181,6 +1361,21 @@ class ClientLoginWidget(QWidget):
         self._srv.setPlaceholderText("https://192.168.x.x:5000")
         cl.addWidget(self._srv)
 
+        cl.addWidget(label("DISCOVERED SERVERS", f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
+        disc_row = QHBoxLayout(); disc_row.setSpacing(8)
+        self._discovered_combo = QComboBox()
+        self._discovered_combo.currentIndexChanged.connect(self._on_discovered_selected)
+        self._scan_btn = QPushButton("RESCAN")
+        self._scan_btn.setObjectName("btn_subtle")
+        self._scan_btn.setFixedHeight(34)
+        self._scan_btn.clicked.connect(self._restart_discovery)
+        disc_row.addWidget(self._discovered_combo)
+        disc_row.addWidget(self._scan_btn)
+        cl.addLayout(disc_row)
+
+        self._discover_status = label("LAN discovery: idle", f"font-size:10px;color:{C['muted']};")
+        cl.addWidget(self._discover_status)
+
         cl.addWidget(label("PASSWORD", f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
         self._pw = QLineEdit()
         self._pw.setEchoMode(QLineEdit.Password)
@@ -1200,6 +1395,106 @@ class ClientLoginWidget(QWidget):
 
         center.addWidget(card)
         root.addLayout(center)
+        self._refresh_discovered_combo()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._start_discovery()
+
+    def hideEvent(self, event):
+        self._stop_discovery()
+        super().hideEvent(event)
+
+    def _go_back(self):
+        self._stop_discovery()
+        self.go_back.emit()
+
+    def _start_discovery(self):
+        if self._discovery_thread and self._discovery_thread.isRunning():
+            return
+        self._discover_status.setText("LAN discovery: scanning...")
+        self._discovery_thread = DiscoveryBrowserThread()
+        self._discovery_thread.service_upsert.connect(self._on_discovered_service)
+        self._discovery_thread.service_remove.connect(self._on_removed_service)
+        self._discovery_thread.status.connect(self._on_discovery_status)
+        self._discovery_thread.finished.connect(self._on_discovery_finished)
+        self._discovery_thread.start()
+
+    def _stop_discovery(self):
+        if not self._discovery_thread:
+            return
+        if self._discovery_thread.isRunning():
+            self._discovery_thread.stop()
+            self._discovery_thread.wait(1200)
+        self._discovery_thread = None
+
+    def _restart_discovery(self):
+        self._discovered_services.clear()
+        self._refresh_discovered_combo()
+        self._stop_discovery()
+        self._start_discovery()
+
+    def _on_discovery_status(self, message):
+        self._discover_status.setText(f"LAN discovery: {message}")
+
+    def _on_discovery_finished(self):
+        if not self._discovered_services:
+            self._discover_status.setText("LAN discovery: no servers found")
+
+    def _refresh_discovered_combo(self, selected_id=None):
+        self._discovered_combo.blockSignals(True)
+        current_id = selected_id if selected_id is not None else self._discovered_combo.currentData()
+        self._discovered_combo.clear()
+        if not self._discovered_services:
+            self._discovered_combo.addItem("No LAN servers found", "")
+            self._discovered_combo.setEnabled(False)
+        else:
+            self._discovered_combo.setEnabled(True)
+            for service_id in sorted(self._discovered_services.keys()):
+                data = self._discovered_services[service_id]
+                self._discovered_combo.addItem(data["display"], service_id)
+            if current_id:
+                idx = self._discovered_combo.findData(current_id)
+                self._discovered_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            else:
+                self._discovered_combo.setCurrentIndex(0)
+        self._discovered_combo.blockSignals(False)
+        if self._discovered_combo.isEnabled():
+            self._on_discovered_selected(self._discovered_combo.currentIndex())
+
+    def _on_discovered_service(self, payload):
+        service_id = payload.get("id", "")
+        if not service_id:
+            return
+        self._discovered_services[service_id] = payload
+        self._refresh_discovered_combo(selected_id=service_id)
+        self._discover_status.setText(
+            f"LAN discovery: {len(self._discovered_services)} server(s) found"
+        )
+        current = self._srv.text().strip()
+        if current in ("", "https://localhost:5000"):
+            self._srv.setText(payload.get("url", current))
+
+    def _on_removed_service(self, service_id):
+        if service_id in self._discovered_services:
+            self._discovered_services.pop(service_id, None)
+            self._refresh_discovered_combo()
+        if self._discovered_services:
+            self._discover_status.setText(
+                f"LAN discovery: {len(self._discovered_services)} server(s) found"
+            )
+        else:
+            self._discover_status.setText("LAN discovery: no servers found")
+
+    def _on_discovered_selected(self, index):
+        if index < 0:
+            return
+        service_id = self._discovered_combo.itemData(index)
+        if not service_id:
+            return
+        data = self._discovered_services.get(service_id)
+        if data and data.get("url"):
+            self._srv.setText(data["url"])
 
     def _do_login(self):
         srv = self._srv.text().strip().rstrip("/")
@@ -1211,6 +1506,10 @@ class ClientLoginWidget(QWidget):
             srv = f"https://{srv}"
             self._srv.setText(srv)
         pw  = self._pw.text()
+        if not srv and self._discovered_services:
+            first = next(iter(self._discovered_services.values()))
+            srv = first.get("url", "")
+            self._srv.setText(srv)
         if not srv or not pw:
             self._err.setText("⚠  Fill in all fields"); return
         self._btn.setText("CONNECTING…"); self._btn.setEnabled(False)
@@ -1218,6 +1517,7 @@ class ClientLoginWidget(QWidget):
         try:
             r = _api_request("POST", f"{srv}/login", json={"password":pw}, timeout=5)
             if r.status_code == 200:
+                self._stop_discovery()
                 self._settings.setValue("client/last_server", srv)
                 self.login_ok.emit(srv, r.json()["token"])
             elif r.status_code == 403:
