@@ -3,17 +3,25 @@ Droplink v2 — Unified Launcher
 Run: python app.py
 Choose Server or Client mode from the launcher screen.
 
-Dependencies: pip install flask werkzeug requests PyQt5
+Dependencies: pip install flask werkzeug requests PyQt5 bcrypt cryptography
 """
 
-import sys, os, time, socket, threading, hashlib, secrets, mimetypes
+import sys, os, time, socket, secrets, mimetypes, ssl, ipaddress
 from pathlib import Path
 from functools import wraps
+from datetime import datetime, timedelta
+
+import bcrypt
 
 # ── Flask (server side) ────────────────────────────────────────────────────────
 from flask import Flask, request, jsonify, send_file, abort
 from werkzeug.utils import secure_filename
 from werkzeug.serving import make_server
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 # ── Qt ─────────────────────────────────────────────────────────────────────────
 from PyQt5.QtWidgets import (
@@ -35,16 +43,16 @@ from PyQt5.QtGui import (
 # ══════════════════════════════════════════════════════════════════════════════
 C = {
     "bg":       "#080A10",
-    "panel":    "#0E111A",
-    "card":     "#141822",
-    "hover":    "#1C2130",
-    "border":   "#1E2438",
+    "panel":    "#0F1422",
+    "card":     "#161C2D",
+    "hover":    "#202942",
+    "border":   "#2A3553",
     "accent":   "#00F5C3",
     "accent2":  "#5B7FFF",
     "purple":   "#A855F7",
-    "text":     "#DDE3F0",
-    "muted":    "#5A6480",
-    "dim":      "#2A3050",
+    "text":     "#E5ECFA",
+    "muted":    "#9AA8C8",
+    "dim":      "#5B698D",
     "danger":   "#FF4D6A",
     "warn":     "#FFB020",
     "success":  "#00F5C3",
@@ -54,6 +62,7 @@ QSS = f"""
 * {{ font-family: 'Consolas', 'Courier New', monospace; }}
 QMainWindow, QWidget, QDialog {{ background: {C['bg']}; color: {C['text']}; }}
 QFrame {{ background: transparent; }}
+QLabel {{ color: {C['text']}; }}
 
 QLineEdit {{
     background: {C['card']};
@@ -64,6 +73,8 @@ QLineEdit {{
     font-size: 13px;
     selection-background-color: {C['accent2']};
 }}
+QLineEdit::placeholder {{ color: {C['dim']}; }}
+QLineEdit:read-only {{ background: {C['panel']}; color: {C['text']}; }}
 QLineEdit:focus {{ border-color: {C['accent']}; }}
 
 QPushButton {{
@@ -75,9 +86,36 @@ QPushButton {{
     font-size: 12px;
     letter-spacing: 1px;
 }}
-QPushButton:hover {{ background: {C['hover']}; border-color: {C['accent']}; color: {C['accent']}; }}
-QPushButton:pressed {{ background: {C['card']}; }}
-QPushButton:disabled {{ color: {C['dim']}; border-color: {C['dim']}; }}
+QPushButton:hover {{ background: {C['hover']}; border-color: {C['accent2']}; color: {C['text']}; }}
+QPushButton:pressed {{ background: {C['panel']}; }}
+QPushButton:disabled {{ color: {C['dim']}; border-color: {C['border']}; background: {C['panel']}; }}
+
+QPushButton#btn_subtle {{
+    background: {C['panel']};
+    border: 1px solid {C['border']};
+    color: {C['muted']};
+}}
+QPushButton#btn_subtle:hover {{
+    border-color: {C['accent2']};
+    color: {C['text']};
+    background: {C['hover']};
+}}
+
+QPushButton#btn_icon,
+QPushButton#btn_field {{
+    background: {C['panel']};
+    border: 1px solid {C['border']};
+    color: {C['muted']};
+    padding: 0;
+    font-size: 13px;
+    letter-spacing: 0;
+}}
+QPushButton#btn_icon:hover,
+QPushButton#btn_field:hover {{
+    border-color: {C['accent']};
+    color: {C['accent']};
+    background: {C['hover']};
+}}
 
 QPushButton#btn_server {{
     background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
@@ -128,9 +166,9 @@ QPushButton#btn_accent:hover {{
 }}
 
 QPushButton#btn_danger {{
-    background: transparent;
+    background: #2A1119;
     border: 1px solid {C['danger']};
-    color: {C['danger']};
+    color: #FF8CA1;
 }}
 QPushButton#btn_danger:hover {{ background: {C['danger']}; color: white; }}
 
@@ -138,13 +176,14 @@ QPushButton#btn_stop {{
     background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
         stop:0 #7B0020, stop:1 #5B0015);
     border: 1px solid {C['danger']};
-    color: {C['danger']};
+    color: #FFD2DB;
     font-weight: bold;
 }}
 QPushButton#btn_stop:hover {{ background: {C['danger']}; color: white; }}
 
 QTableWidget {{
-    background: {C['panel']};
+    background: #11192B;
+    alternate-background-color: #0D1322;
     border: 1px solid {C['border']};
     border-radius: 8px;
     gridline-color: {C['border']};
@@ -153,10 +192,11 @@ QTableWidget {{
     outline: none;
 }}
 QTableWidget::item {{ padding: 6px 10px; border-bottom: 1px solid {C['border']}; }}
-QTableWidget::item:selected {{ background: {C['hover']}; color: {C['accent']}; }}
+QTableWidget::item:selected {{ background: #263452; color: #F2F8FF; }}
+QTableWidget::item:hover {{ background: #1E2A44; }}
 QHeaderView::section {{
-    background: {C['card']};
-    color: {C['muted']};
+    background: #1A2236;
+    color: #B8C5E3;
     padding: 8px 10px;
     border: none;
     border-bottom: 1px solid {C['border']};
@@ -179,7 +219,7 @@ QProgressBar::chunk {{
 }}
 
 QTextEdit {{
-    background: {C['panel']};
+    background: #10182A;
     border: 1px solid {C['border']};
     border-radius: 8px;
     color: {C['text']};
@@ -189,7 +229,7 @@ QTextEdit {{
 }}
 
 QScrollBar:vertical {{
-    background: {C['panel']}; width: 5px; border-radius: 3px;
+    background: #0D1322; width: 6px; border-radius: 3px;
 }}
 QScrollBar::handle:vertical {{
     background: {C['dim']}; border-radius: 3px; min-height: 20px;
@@ -197,7 +237,7 @@ QScrollBar::handle:vertical {{
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 
 QScrollBar:horizontal {{
-    background: {C['panel']}; height: 5px; border-radius: 3px;
+    background: #0D1322; height: 6px; border-radius: 3px;
 }}
 QScrollBar::handle:horizontal {{
     background: {C['dim']}; border-radius: 3px;
@@ -241,6 +281,84 @@ def hline():
     f = QFrame(); f.setFrameShape(QFrame.HLine)
     f.setStyleSheet(f"color: {C['border']};"); return f
 
+
+def _hash_password(password: str) -> bytes:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=13))
+
+
+def _verify_password(password: str, password_hash: bytes) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash)
+    except ValueError:
+        return False
+
+
+TLS_DIR = Path("certs")
+TLS_CERT_FILE = TLS_DIR / "droplink-cert.pem"
+TLS_KEY_FILE = TLS_DIR / "droplink-key.pem"
+
+
+def _ensure_self_signed_cert(cert_file: Path, key_file: Path):
+    if cert_file.exists() and key_file.exists():
+        return
+
+    cert_file.parent.mkdir(parents=True, exist_ok=True)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "Droplink Local Server"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Droplink"),
+    ])
+
+    san_entries = [
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+    ]
+    local_ip = get_local_ip()
+    try:
+        san_entries.append(x509.IPAddress(ipaddress.ip_address(local_ip)))
+    except ValueError:
+        pass
+
+    now = datetime.utcnow()
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+        .sign(private_key=key, algorithm=hashes.SHA256())
+    )
+
+    key_file.write_bytes(
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+    try:
+        os.chmod(key_file, 0o600)
+    except OSError:
+        pass
+
+
+def _build_tls_context(cert_file: Path, key_file: Path) -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.options |= ssl.OP_NO_COMPRESSION
+    try:
+        context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20")
+    except ssl.SSLError:
+        pass
+    context.load_cert_chain(certfile=str(cert_file), keyfile=str(key_file))
+    return context
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  FLASK BACKEND (runs in a thread)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -248,7 +366,7 @@ SYNC_FOLDER = Path("synced")
 SYNC_FOLDER.mkdir(exist_ok=True)
 _flask_app = Flask(__name__)
 _server_state = {
-    "password": "dropbox123",
+    "password_hash": _hash_password("dropbox123"),
     "tokens": {},          # token -> expiry
     "log_cb": None,        # callable(msg) — GUI log callback
     "clients": {},         # ip -> last_seen timestamp
@@ -259,8 +377,6 @@ def _log(msg):
     full = f"[{ts}]  {msg}"
     if _server_state["log_cb"]:
         _server_state["log_cb"](full)
-
-def _hash(pw): return hashlib.sha256(pw.encode()).hexdigest()
 
 def _require(f):
     @wraps(f)
@@ -282,7 +398,7 @@ def _ping():
 @_flask_app.route("/login", methods=["POST"])
 def _login():
     data = request.get_json() or {}
-    if _hash(data.get("password","")) != _hash(_server_state["password"]):
+    if not _verify_password(data.get("password", ""), _server_state["password_hash"]):
         _log(f"❌  Failed login from {request.remote_addr}")
         return jsonify({"error":"Invalid password"}), 403
     tok = secrets.token_hex(24)
@@ -362,6 +478,8 @@ class FlaskThread(QThread):
         super().__init__()
         self.port = port
         self._http_server = None
+        self.cert_file = TLS_CERT_FILE
+        self.key_file = TLS_KEY_FILE
 
     def run(self):
         import logging
@@ -369,7 +487,15 @@ class FlaskThread(QThread):
         log.setLevel(logging.ERROR)
 
         try:
-            self._http_server = make_server("0.0.0.0", self.port, _flask_app, threaded=True)
+            _ensure_self_signed_cert(self.cert_file, self.key_file)
+            tls_context = _build_tls_context(self.cert_file, self.key_file)
+            self._http_server = make_server(
+                "0.0.0.0",
+                self.port,
+                _flask_app,
+                threaded=True,
+                ssl_context=tls_context,
+            )
             self.started_ok.emit()
             self._http_server.serve_forever()
         except Exception as e:
@@ -385,6 +511,16 @@ class FlaskThread(QThread):
 #  WORKER THREADS (client side)
 # ══════════════════════════════════════════════════════════════════════════════
 import requests as _req
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
+
+urllib3.disable_warnings(InsecureRequestWarning)
+
+
+def _api_request(method, url, **kwargs):
+    if url.lower().startswith("https://"):
+        kwargs.setdefault("verify", False)
+    return _req.request(method, url, **kwargs)
 
 class UploadWorker(QThread):
     progress = pyqtSignal(int)
@@ -410,7 +546,8 @@ class UploadWorker(QThread):
                     def __getattr__(self_, k):
                         return getattr(orig, k)
 
-                r = _req.post(
+                r = _api_request(
+                    "POST",
                     f"{self.srv}/upload",
                     headers={"X-Auth-Token": self.tok},
                     files={"file": (name, Wrapped())},
@@ -430,7 +567,7 @@ class DownloadWorker(QThread):
         super().__init__(); self.srv=srv; self.tok=tok; self.rp=rp; self.sp=sp
     def run(self):
         try:
-            r = _req.get(f"{self.srv}/download/{self.rp}",
+            r = _api_request("GET", f"{self.srv}/download/{self.rp}",
                 headers={"X-Auth-Token":self.tok}, stream=True, timeout=120)
             if not r.ok:
                 self.done.emit(False, f"HTTP {r.status_code}")
@@ -452,7 +589,7 @@ class PreviewWorker(QThread):
         super().__init__(); self.srv=srv; self.tok=tok; self.rp=rp
     def run(self):
         try:
-            r = _req.get(f"{self.srv}/preview/{self.rp}",
+            r = _api_request("GET", f"{self.srv}/preview/{self.rp}",
                 headers={"X-Auth-Token":self.tok}, timeout=30)
             if not r.ok:
                 self.error.emit(f"HTTP {r.status_code}")
@@ -468,7 +605,7 @@ class FileFetchWorker(QThread):
         super().__init__(); self.srv=srv; self.tok=tok
     def run(self):
         try:
-            r = _req.get(f"{self.srv}/files",
+            r = _api_request("GET", f"{self.srv}/files",
                 headers={"X-Auth-Token":self.tok}, timeout=8)
             if not r.ok:
                 self.error.emit(f"HTTP {r.status_code}")
@@ -562,8 +699,8 @@ class LauncherWidget(QWidget):
         cards.addWidget(cli_card)
         wl.addLayout(cards)
 
-        foot = label("Only use on trusted local networks  ·  No HTTPS",
-            f"font-size:10px;color:{C['dim']};")
+        foot = label("Local network only  ·  Self-signed HTTPS enabled",
+            f"font-size:10px;color:{C['muted']};")
         foot.setAlignment(Qt.AlignCenter)
         wl.addWidget(foot)
 
@@ -593,6 +730,7 @@ class ServerWidget(QWidget):
         bar.setStyleSheet(f"background:{C['panel']};border-bottom:1px solid {C['border']};")
         bl = QHBoxLayout(bar); bl.setContentsMargins(20,0,20,0)
         back_btn = QPushButton("← BACK")
+        back_btn.setObjectName("btn_subtle")
         back_btn.setFixedSize(90,32)
         back_btn.clicked.connect(self._confirm_back)
         bl.addWidget(back_btn)
@@ -628,6 +766,7 @@ class ServerWidget(QWidget):
         self._pw_input = QLineEdit("dropbox123")
         self._pw_input.setEchoMode(QLineEdit.Password)
         self._show_pw = QPushButton("👁"); self._show_pw.setFixedSize(36,36)
+        self._show_pw.setObjectName("btn_field")
         self._show_pw.setCheckable(True)
         self._show_pw.toggled.connect(lambda c: self._pw_input.setEchoMode(
             QLineEdit.Normal if c else QLineEdit.Password))
@@ -640,6 +779,7 @@ class ServerWidget(QWidget):
         self._folder_input = QLineEdit(str(SYNC_FOLDER.resolve()))
         self._folder_input.setReadOnly(True)
         self._folder_btn = QPushButton("…"); self._folder_btn.setFixedSize(36,36)
+        self._folder_btn.setObjectName("btn_field")
         self._folder_btn.clicked.connect(self._pick_folder)
         fol_row.addWidget(self._folder_input); fol_row.addWidget(self._folder_btn)
         ll.addLayout(fol_row)
@@ -665,8 +805,8 @@ class ServerWidget(QWidget):
         ll.addWidget(label("SERVER INFO",
             f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
 
-        self._info_local  = label("Local:  —", f"font-size:11px;color:{C['muted']};")
-        self._info_net    = label("Network:  —", f"font-size:11px;color:{C['muted']};")
+        self._info_local  = label("Local:  —", f"font-size:11px;color:{C['text']};")
+        self._info_net    = label("Network:  —", f"font-size:11px;color:{C['text']};")
         self._info_clients = label("Clients:  0", f"font-size:11px;color:{C['muted']};")
         self._info_files  = label("Files:  0", f"font-size:11px;color:{C['muted']};")
         for w in [self._info_local,self._info_net,self._info_clients,self._info_files]:
@@ -689,6 +829,7 @@ class ServerWidget(QWidget):
             f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
         log_hdr.addStretch()
         clr_btn = QPushButton("CLEAR"); clr_btn.setFixedSize(60,24)
+        clr_btn.setObjectName("btn_subtle")
         clr_btn.clicked.connect(lambda: self._log_box.clear())
         log_hdr.addWidget(clr_btn)
         self._log_box = QTextEdit()
@@ -706,6 +847,7 @@ class ServerWidget(QWidget):
             f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
         file_hdr.addStretch()
         ref_btn = QPushButton("⟳"); ref_btn.setFixedSize(28,24)
+        ref_btn.setObjectName("btn_icon")
         ref_btn.clicked.connect(self._refresh_server_files)
         file_hdr.addWidget(ref_btn)
         self._srv_file_table = QTableWidget()
@@ -716,6 +858,7 @@ class ServerWidget(QWidget):
         self._srv_file_table.verticalHeader().setVisible(False)
         self._srv_file_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._srv_file_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._srv_file_table.setAlternatingRowColors(True)
         fpl.addLayout(file_hdr)
         fpl.addWidget(self._srv_file_table)
 
@@ -760,6 +903,9 @@ class ServerWidget(QWidget):
         if not pw:
             QMessageBox.warning(self, "Error", "Password cannot be empty.")
             return
+        if len(pw) < 10:
+            QMessageBox.warning(self, "Error", "Use a stronger password (at least 10 characters).")
+            return
 
         port_text = self._port_input.text().strip()
         if not port_text:
@@ -776,7 +922,7 @@ class ServerWidget(QWidget):
             QMessageBox.warning(self, "Error", "Port must be between 1 and 65535.")
             return
 
-        _server_state["password"] = pw
+        _server_state["password_hash"] = _hash_password(pw)
         _server_state["tokens"].clear()
         _server_state["clients"].clear()
         _server_state["log_cb"] = self._append_log
@@ -795,13 +941,14 @@ class ServerWidget(QWidget):
     def _on_server_started(self, port):
         self._running = True
         ip = get_local_ip()
-        self._info_local.setText(f"Local:  http://localhost:{port}")
-        self._info_net.setText(f"Network:  http://{ip}:{port}")
+        self._info_local.setText(f"Local:  https://localhost:{port}")
+        self._info_net.setText(f"Network:  https://{ip}:{port}")
         self._set_status("● ONLINE", C["success"])
         self._start_btn.hide()
         self._stop_btn.setEnabled(True)
         self._stop_btn.show()
         self._append_log(f"🚀  Server started on port {port}")
+        self._append_log(f"🔒  HTTPS enabled (self-signed): {TLS_CERT_FILE.resolve()}")
         self._append_log(f"📁  Sync folder: {SYNC_FOLDER.resolve()}")
         self._refresh_server_files()
 
@@ -961,6 +1108,7 @@ class ClientLoginWidget(QWidget):
         bar.setStyleSheet(f"background:{C['panel']};border-bottom:1px solid {C['border']};")
         bl = QHBoxLayout(bar); bl.setContentsMargins(20,0,20,0)
         back = QPushButton("← BACK"); back.setFixedSize(90,32)
+        back.setObjectName("btn_subtle")
         back.clicked.connect(self.go_back)
         bl.addWidget(back)
         bl.addWidget(label("CLIENT MODE",
@@ -990,9 +1138,9 @@ class ClientLoginWidget(QWidget):
         cl.addWidget(hline())
 
         cl.addWidget(label("SERVER ADDRESS", f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
-        last_server = self._settings.value("client/last_server", "http://localhost:5000")
+        last_server = self._settings.value("client/last_server", "https://localhost:5000")
         self._srv = QLineEdit(str(last_server))
-        self._srv.setPlaceholderText("http://192.168.x.x:5000")
+        self._srv.setPlaceholderText("https://192.168.x.x:5000")
         cl.addWidget(self._srv)
 
         cl.addWidget(label("PASSWORD", f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
@@ -1017,8 +1165,12 @@ class ClientLoginWidget(QWidget):
 
     def _do_login(self):
         srv = self._srv.text().strip().rstrip("/")
-        if srv and not srv.startswith(("http://", "https://")):
-            srv = f"http://{srv}"
+        srv_lower = srv.lower()
+        if srv_lower.startswith("http://"):
+            srv = f"https://{srv[7:]}"
+            self._srv.setText(srv)
+        elif srv and not srv_lower.startswith(("http://", "https://")):
+            srv = f"https://{srv}"
             self._srv.setText(srv)
         pw  = self._pw.text()
         if not srv or not pw:
@@ -1026,7 +1178,7 @@ class ClientLoginWidget(QWidget):
         self._btn.setText("CONNECTING…"); self._btn.setEnabled(False)
         self._err.setText("")
         try:
-            r = _req.post(f"{srv}/login", json={"password":pw}, timeout=5)
+            r = _api_request("POST", f"{srv}/login", json={"password":pw}, timeout=5)
             if r.status_code == 200:
                 self._settings.setValue("client/last_server", srv)
                 self.login_ok.emit(srv, r.json()["token"])
@@ -1073,6 +1225,7 @@ class ClientDashWidget(QWidget):
             f"font-size:11px;color:{C['success']};letter-spacing:1px;"))
         bl.addStretch()
         self._refresh_btn = QPushButton("⟳")
+        self._refresh_btn.setObjectName("btn_icon")
         self._refresh_btn.setFixedSize(32, 28)
         self._refresh_btn.setToolTip("Refresh now")
         self._refresh_btn.clicked.connect(self._refresh)
@@ -1094,9 +1247,13 @@ class ClientDashWidget(QWidget):
         self._upload_btn = QPushButton("↑ UPLOAD")
         self._upload_btn.setObjectName("btn_accent"); self._upload_btn.setFixedHeight(36)
         self._upload_btn.clicked.connect(self._upload)
-        self._dl_btn = QPushButton("↓ DOWNLOAD"); self._dl_btn.setFixedHeight(36)
+        self._dl_btn = QPushButton("↓ DOWNLOAD")
+        self._dl_btn.setObjectName("btn_subtle")
+        self._dl_btn.setFixedHeight(36)
         self._dl_btn.clicked.connect(self._download)
-        self._prev_btn = QPushButton("◉ PREVIEW"); self._prev_btn.setFixedHeight(36)
+        self._prev_btn = QPushButton("◉ PREVIEW")
+        self._prev_btn.setObjectName("btn_subtle")
+        self._prev_btn.setFixedHeight(36)
         self._prev_btn.clicked.connect(self._preview)
         self._del_btn = QPushButton("✕ DELETE")
         self._del_btn.setObjectName("btn_danger"); self._del_btn.setFixedHeight(36)
@@ -1112,6 +1269,7 @@ class ClientDashWidget(QWidget):
         self._filter_input.setPlaceholderText("Filter files by name…")
         self._filter_input.textChanged.connect(self._apply_filter)
         self._clear_filter_btn = QPushButton("CLEAR")
+        self._clear_filter_btn.setObjectName("btn_subtle")
         self._clear_filter_btn.setFixedSize(64, 30)
         self._clear_filter_btn.clicked.connect(lambda: self._filter_input.clear())
         flt.addWidget(self._filter_input)
@@ -1135,6 +1293,7 @@ class ClientDashWidget(QWidget):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setAlternatingRowColors(True)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
         self._table.doubleClicked.connect(self._preview)
         ll.addWidget(self._table)
@@ -1152,7 +1311,9 @@ class ClientDashWidget(QWidget):
         ph.addWidget(label("PREVIEW PANEL",
             f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
         ph.addStretch()
-        self._pop_btn = QPushButton("⤢"); self._pop_btn.setFixedSize(28,24)
+        self._pop_btn = QPushButton("⤢")
+        self._pop_btn.setObjectName("btn_icon")
+        self._pop_btn.setFixedSize(28,24)
         self._pop_btn.setToolTip("Open in popup")
         self._pop_btn.clicked.connect(self._popup_preview)
         self._pop_btn.setEnabled(False)
@@ -1412,7 +1573,7 @@ class ClientDashWidget(QWidget):
             QMessageBox.Yes|QMessageBox.No)
         if r != QMessageBox.Yes: return
         try:
-            resp = _req.delete(f"{self.server}/delete/{name}",
+            resp = _api_request("DELETE", f"{self.server}/delete/{name}",
                 headers={"X-Auth-Token":self.token}, timeout=5)
             if resp.ok:
                 self._refresh()
@@ -1428,7 +1589,7 @@ class ClientDashWidget(QWidget):
         self._sync_timer.stop()
         self._last_preview = None
         self._pop_btn.setEnabled(False)
-        try: _req.post(f"{self.server}/logout",
+        try: _api_request("POST", f"{self.server}/logout",
             headers={"X-Auth-Token":self.token}, timeout=3)
         except: pass
         self.go_back.emit()

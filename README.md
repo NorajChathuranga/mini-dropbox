@@ -24,11 +24,13 @@ Choose **SERVER** or **CLIENT** mode when the app starts.
 - Click **START SERVER**
 - See live activity log, connected clients count, and file list
 - Your LAN IP is shown — share it with clients
+- Server runs on **HTTPS** with an auto-generated self-signed certificate
 
 ### 3. Client Mode — Login
 - Enter the server's IP (shown on the server screen)
 - Enter the password
 - Click **CONNECT**
+- Use `https://` address (example: `https://192.168.x.x:5000`)
 
 ### 4. Client Mode — Dashboard
 | Feature | How |
@@ -51,5 +53,7 @@ Choose **SERVER** or **CLIENT** mode when the app starts.
 
 ## ⚠️ Notes
 - LAN only — do not expose to the internet
-- No HTTPS — use on trusted networks only
+- HTTPS is enabled using a self-signed certificate generated on first start
+- The certificate/key are stored in `./certs/`
+- Passwords are stored as bcrypt hashes in memory (never plaintext)
 - The `synced/` folder is created next to `app.py` by default

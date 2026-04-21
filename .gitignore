@@ -33,3 +33,6 @@ Thumbs.db
 
 # App-generated shared folder contents
 synced/
+
+# Auto-generated TLS material
+certs/
