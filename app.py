@@ -3,20 +3,22 @@ Droplink v2 — Unified Launcher
 Run: python app.py
 Choose Server or Client mode from the launcher screen.
 
-Dependencies: pip install flask werkzeug requests PyQt5 bcrypt cryptography
+Dependencies: pip install fastapi uvicorn python-multipart requests PyQt5 bcrypt cryptography
 """
 
 import sys, os, time, socket, secrets, mimetypes, ssl, ipaddress
+import re
 from pathlib import Path
-from functools import wraps
 from datetime import datetime, timedelta
+from typing import Optional
 
 import bcrypt
+import uvicorn
 
-# ── Flask (server side) ────────────────────────────────────────────────────────
-from flask import Flask, request, jsonify, send_file, abort
-from werkzeug.utils import secure_filename
-from werkzeug.serving import make_server
+# ── FastAPI (server side) ──────────────────────────────────────────────────────
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -348,23 +350,17 @@ def _ensure_self_signed_cert(cert_file: Path, key_file: Path):
         pass
 
 
-def _build_tls_context(cert_file: Path, key_file: Path) -> ssl.SSLContext:
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.options |= ssl.OP_NO_COMPRESSION
-    try:
-        context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20")
-    except ssl.SSLError:
-        pass
-    context.load_cert_chain(certfile=str(cert_file), keyfile=str(key_file))
-    return context
+def _safe_filename(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", Path(name or "").name)
+    return cleaned.strip("._")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FLASK BACKEND (runs in a thread)
+#  FASTAPI BACKEND (runs in a thread)
 # ══════════════════════════════════════════════════════════════════════════════
 SYNC_FOLDER = Path("synced")
 SYNC_FOLDER.mkdir(exist_ok=True)
-_flask_app = Flask(__name__)
+_api_app = FastAPI(title="Droplink API", version="2.0")
 _server_state = {
     "password_hash": _hash_password("dropbox123"),
     "tokens": {},          # token -> expiry
@@ -372,140 +368,182 @@ _server_state = {
     "clients": {},         # ip -> last_seen timestamp
 }
 
+
+class LoginPayload(BaseModel):
+    password: str = ""
+
+
 def _log(msg):
     ts = time.strftime("%H:%M:%S")
     full = f"[{ts}]  {msg}"
     if _server_state["log_cb"]:
         _server_state["log_cb"](full)
 
-def _require(f):
-    @wraps(f)
-    def wrap(*a, **kw):
-        tok = request.headers.get("X-Auth-Token","")
-        if tok not in _server_state["tokens"]:
-            abort(401)
-        if time.time() > _server_state["tokens"][tok]:
-            del _server_state["tokens"][tok]; abort(401)
-        ip = request.remote_addr
-        _server_state["clients"][ip] = time.time()
-        return f(*a, **kw)
-    return wrap
 
-@_flask_app.route("/ping")
-def _ping():
-    return jsonify({"status":"ok","version":"2.0"})
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
 
-@_flask_app.route("/login", methods=["POST"])
-def _login():
-    data = request.get_json() or {}
-    if not _verify_password(data.get("password", ""), _server_state["password_hash"]):
-        _log(f"❌  Failed login from {request.remote_addr}")
-        return jsonify({"error":"Invalid password"}), 403
+
+def _resolve_within_sync(path_str: str) -> Path:
+    root = SYNC_FOLDER.resolve()
+    full = (root / path_str).resolve()
+    try:
+        full.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Forbidden path")
+    return full
+
+
+def _require_auth(
+    request: Request,
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
+) -> str:
+    tok = (x_auth_token or "").strip()
+    if tok not in _server_state["tokens"]:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if time.time() > _server_state["tokens"][tok]:
+        _server_state["tokens"].pop(tok, None)
+        raise HTTPException(status_code=401, detail="Session expired")
+    _server_state["clients"][_client_ip(request)] = time.time()
+    return tok
+
+
+@_api_app.get("/ping")
+async def _ping():
+    return {"status": "ok", "version": "2.0"}
+
+
+@_api_app.post("/login")
+async def _login(data: LoginPayload, request: Request):
+    if not _verify_password(data.password, _server_state["password_hash"]):
+        _log(f"❌  Failed login from {_client_ip(request)}")
+        raise HTTPException(status_code=403, detail="Invalid password")
     tok = secrets.token_hex(24)
     _server_state["tokens"][tok] = time.time() + 86400
-    _log(f"✅  Client connected: {request.remote_addr}")
-    return jsonify({"token": tok})
+    _log(f"✅  Client connected: {_client_ip(request)}")
+    return {"token": tok}
 
-@_flask_app.route("/logout", methods=["POST"])
-@_require
-def _logout():
-    tok = request.headers.get("X-Auth-Token","")
+
+@_api_app.post("/logout")
+async def _logout(request: Request, tok: str = Depends(_require_auth)):
     _server_state["tokens"].pop(tok, None)
-    _log(f"👋  Client disconnected: {request.remote_addr}")
-    return jsonify({"status":"ok"})
+    _log(f"👋  Client disconnected: {_client_ip(request)}")
+    return {"status": "ok"}
 
-@_flask_app.route("/files")
-@_require
-def _files():
+
+@_api_app.get("/files")
+async def _files(_tok: str = Depends(_require_auth)):
     out = []
     for p in SYNC_FOLDER.rglob("*"):
         if p.is_file():
             st = p.stat()
-            out.append({"name": str(p.relative_to(SYNC_FOLDER)),
-                        "size": st.st_size, "modified": st.st_mtime})
-    return jsonify({"files": out})
+            out.append({
+                "name": str(p.relative_to(SYNC_FOLDER)),
+                "size": st.st_size,
+                "modified": st.st_mtime,
+            })
+    return {"files": out}
 
-@_flask_app.route("/upload", methods=["POST"])
-@_require
-def _upload():
-    f = request.files.get("file")
-    if not f: return jsonify({"error":"No file"}), 400
-    sub = request.form.get("path","")
-    name = secure_filename(f.filename)
-    dest = (SYNC_FOLDER / sub / name) if sub else (SYNC_FOLDER / name)
+
+@_api_app.post("/upload")
+async def _upload(
+    request: Request,
+    _tok: str = Depends(_require_auth),
+    file: UploadFile = File(...),
+    path: str = Form(default=""),
+):
+    name = _safe_filename(file.filename or "")
+    if not name:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    relative_dest = str(Path(path) / name) if path else name
+    dest = _resolve_within_sync(relative_dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    f.save(str(dest))
-    _log(f"↑  Uploaded: {name}  ({fmt_size(dest.stat().st_size)})  from {request.remote_addr}")
-    return jsonify({"status":"ok","file":name})
 
-@_flask_app.route("/download/<path:fp>")
-@_require
-def _download(fp):
-    full = (SYNC_FOLDER / fp).resolve()
-    try: full.relative_to(SYNC_FOLDER.resolve())
-    except ValueError: abort(403)
-    if not full.is_file(): abort(404)
-    _log(f"↓  Downloaded: {fp}  by {request.remote_addr}")
-    return send_file(str(full), as_attachment=True, download_name=full.name)
+    with dest.open("wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+    await file.close()
 
-@_flask_app.route("/preview/<path:fp>")
-@_require
-def _preview(fp):
-    """Returns file content for preview (no attachment header)."""
-    full = (SYNC_FOLDER / fp).resolve()
-    try: full.relative_to(SYNC_FOLDER.resolve())
-    except ValueError: abort(403)
-    if not full.is_file(): abort(404)
+    _log(f"↑  Uploaded: {name}  ({fmt_size(dest.stat().st_size)})  from {_client_ip(request)}")
+    return {"status": "ok", "file": name}
+
+
+@_api_app.get("/download/{fp:path}")
+async def _download(fp: str, request: Request, _tok: str = Depends(_require_auth)):
+    full = _resolve_within_sync(fp)
+    if not full.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
     mime, _ = mimetypes.guess_type(str(full))
-    return send_file(str(full), mimetype=mime or "application/octet-stream")
+    _log(f"↓  Downloaded: {fp}  by {_client_ip(request)}")
+    return FileResponse(
+        path=str(full),
+        media_type=mime or "application/octet-stream",
+        filename=full.name,
+    )
 
-@_flask_app.route("/delete/<path:fp>", methods=["DELETE"])
-@_require
-def _delete(fp):
-    full = (SYNC_FOLDER / fp).resolve()
-    try: full.relative_to(SYNC_FOLDER.resolve())
-    except ValueError: abort(403)
-    if not full.is_file(): abort(404)
+
+@_api_app.get("/preview/{fp:path}")
+async def _preview(fp: str, _tok: str = Depends(_require_auth)):
+    full = _resolve_within_sync(fp)
+    if not full.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    mime, _ = mimetypes.guess_type(str(full))
+    return FileResponse(path=str(full), media_type=mime or "application/octet-stream")
+
+
+@_api_app.delete("/delete/{fp:path}")
+async def _delete(fp: str, request: Request, _tok: str = Depends(_require_auth)):
+    full = _resolve_within_sync(fp)
+    if not full.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
     full.unlink()
-    _log(f"🗑  Deleted: {fp}  by {request.remote_addr}")
-    return jsonify({"status":"ok"})
+    _log(f"🗑  Deleted: {fp}  by {_client_ip(request)}")
+    return {"status": "ok"}
 
-class FlaskThread(QThread):
+
+class UvicornThread(QThread):
     started_ok = pyqtSignal()
     failed = pyqtSignal(str)
 
     def __init__(self, port=5000):
         super().__init__()
         self.port = port
-        self._http_server = None
+        self._server = None
         self.cert_file = TLS_CERT_FILE
         self.key_file = TLS_KEY_FILE
 
     def run(self):
         import logging
-        log = logging.getLogger("werkzeug")
-        log.setLevel(logging.ERROR)
+
+        logging.getLogger("uvicorn.error").setLevel(logging.ERROR)
+        logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
 
         try:
             _ensure_self_signed_cert(self.cert_file, self.key_file)
-            tls_context = _build_tls_context(self.cert_file, self.key_file)
-            self._http_server = make_server(
-                "0.0.0.0",
-                self.port,
-                _flask_app,
-                threaded=True,
-                ssl_context=tls_context,
+            config = uvicorn.Config(
+                _api_app,
+                host="0.0.0.0",
+                port=self.port,
+                access_log=False,
+                log_level="error",
+                ssl_certfile=str(self.cert_file),
+                ssl_keyfile=str(self.key_file),
             )
+            self._server = uvicorn.Server(config)
             self.started_ok.emit()
-            self._http_server.serve_forever()
+            self._server.run()
         except Exception as e:
             self.failed.emit(str(e))
         finally:
-            self._http_server = None
+            self._server = None
 
     def stop(self):
-        if self._http_server is not None:
-            self._http_server.shutdown()
+        if self._server is not None:
+            self._server.should_exit = True
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  WORKER THREADS (client side)
@@ -714,7 +752,7 @@ class ServerWidget(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._flask_thread = None
+        self._server_thread = None
         self._running = False
         self._folder_btn = None
         self._workers = []
@@ -927,16 +965,16 @@ class ServerWidget(QWidget):
         _server_state["clients"].clear()
         _server_state["log_cb"] = self._append_log
 
-        self._flask_thread = FlaskThread(port)
-        self._flask_thread.started_ok.connect(lambda p=port: self._on_server_started(p))
-        self._flask_thread.failed.connect(self._on_server_failed)
-        self._flask_thread.finished.connect(self._on_server_stopped)
+        self._server_thread = UvicornThread(port)
+        self._server_thread.started_ok.connect(lambda p=port: self._on_server_started(p))
+        self._server_thread.failed.connect(self._on_server_failed)
+        self._server_thread.finished.connect(self._on_server_stopped)
 
         self._set_server_controls(False)
         self._start_btn.setEnabled(False)
         self._set_status("● STARTING…", C["warn"])
         self._append_log(f"⏳  Starting server on port {port}...")
-        self._flask_thread.start()
+        self._server_thread.start()
 
     def _on_server_started(self, port):
         self._running = True
@@ -964,16 +1002,16 @@ class ServerWidget(QWidget):
         self._start_btn.show()
         self._stop_btn.hide()
         self._info_clients.setText("Clients:  0")
-        self._flask_thread = None
+        self._server_thread = None
 
     def _stop_server(self):
-        if not self._flask_thread:
+        if not self._server_thread:
             self._on_server_stopped()
             return
         self._stop_btn.setEnabled(False)
         self._set_status("● STOPPING…", C["warn"])
         self._append_log("⏹  Stopping server...")
-        self._flask_thread.stop()
+        self._server_thread.stop()
 
     def _append_log(self, msg):
         self._log_box.append(
@@ -1644,8 +1682,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self._srv_widget._running:
             self._srv_widget._stop_server()
-            if self._srv_widget._flask_thread:
-                self._srv_widget._flask_thread.wait(2000)
+            if self._srv_widget._server_thread:
+                self._srv_widget._server_thread.wait(2000)
         super().closeEvent(event)
 
 # ══════════════════════════════════════════════════════════════════════════════

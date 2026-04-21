@@ -1,6 +1,7 @@
 # Droplink v2 — Unified Desktop App
 
 One app. Choose your role. Share files over your local network.
+Backend runs on FastAPI + Uvicorn.
 
 ---
 
