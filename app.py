@@ -3,20 +3,22 @@ Droplink v2 — Unified Launcher
 Run: python app.py
 Choose Server or Client mode from the launcher screen.
 
-Dependencies: pip install fastapi uvicorn python-multipart requests PyQt5 bcrypt cryptography
+Dependencies:
+    pip install fastapi uvicorn python-multipart zeroconf requests PyQt5 bcrypt cryptography
 """
 
 import sys, os, time, socket, secrets, mimetypes, ssl, ipaddress
-import re
+import re, json, hashlib, threading
 from pathlib import Path
-from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone   # ← FIX: added timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import bcrypt
 import uvicorn
 from zeroconf import IPVersion, ServiceBrowser, ServiceInfo, ServiceListener, Zeroconf
 
-# ── FastAPI (server side) ──────────────────────────────────────────────────────
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -26,40 +28,38 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-# ── Qt ─────────────────────────────────────────────────────────────────────────
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QProgressBar, QFileDialog, QMessageBox, QFrame, QHeaderView,
     QStackedWidget, QAbstractItemView, QTextEdit, QSplitter,
-    QScrollArea, QSizePolicy, QSpacerItem, QDialog, QDialogButtonBox,
-    QComboBox
+    QScrollArea, QDialog, QComboBox,
 )
 from PyQt5.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QSize, QByteArray, QSettings
+    Qt, QThread, pyqtSignal, QTimer, QByteArray, QSettings,
 )
 from PyQt5.QtGui import (
-    QFont, QColor, QPalette, QPixmap, QImage, QTextCursor, QIntValidator
+    QFont, QColor, QPixmap, QTextCursor, QIntValidator,
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  THEME
 # ══════════════════════════════════════════════════════════════════════════════
 C = {
-    "bg":       "#080A10",
-    "panel":    "#0F1422",
-    "card":     "#161C2D",
-    "hover":    "#202942",
-    "border":   "#2A3553",
-    "accent":   "#00F5C3",
-    "accent2":  "#5B7FFF",
-    "purple":   "#A855F7",
-    "text":     "#E5ECFA",
-    "muted":    "#9AA8C8",
-    "dim":      "#5B698D",
-    "danger":   "#FF4D6A",
-    "warn":     "#FFB020",
-    "success":  "#00F5C3",
+    "bg":      "#080A10",
+    "panel":   "#0F1422",
+    "card":    "#161C2D",
+    "hover":   "#202942",
+    "border":  "#2A3553",
+    "accent":  "#00F5C3",
+    "accent2": "#5B7FFF",
+    "purple":  "#A855F7",
+    "text":    "#E5ECFA",
+    "muted":   "#9AA8C8",
+    "dim":     "#5B698D",
+    "danger":  "#FF4D6A",
+    "warn":    "#FFB020",
+    "success": "#00F5C3",
 }
 
 QSS = f"""
@@ -78,7 +78,7 @@ QLineEdit {{
     selection-background-color: {C['accent2']};
 }}
 QLineEdit::placeholder {{ color: {C['dim']}; }}
-QLineEdit:read-only {{ background: {C['panel']}; color: {C['text']}; }}
+QLineEdit:read-only {{ background: {C['panel']}; color: {C['muted']}; }}
 QLineEdit:focus {{ border-color: {C['accent']}; }}
 
 QComboBox {{
@@ -90,20 +90,13 @@ QComboBox {{
     font-size: 12px;
 }}
 QComboBox:focus {{ border-color: {C['accent']}; }}
-QComboBox::drop-down {{
-    border: none;
-    width: 22px;
-}}
-QComboBox::down-arrow {{
-    image: none;
-    width: 0;
-}}
+QComboBox::drop-down {{ border: none; width: 22px; }}
+QComboBox::down-arrow {{ image: none; width: 0; }}
 QComboBox QAbstractItemView {{
     background: {C['panel']};
     border: 1px solid {C['border']};
     color: {C['text']};
     selection-background-color: {C['hover']};
-    selection-color: {C['text']};
 }}
 
 QPushButton {{
@@ -223,6 +216,7 @@ QTableWidget {{
 QTableWidget::item {{ padding: 6px 10px; border-bottom: 1px solid {C['border']}; }}
 QTableWidget::item:selected {{ background: #263452; color: #F2F8FF; }}
 QTableWidget::item:hover {{ background: #1E2A44; }}
+
 QHeaderView::section {{
     background: #1A2236;
     color: #B8C5E3;
@@ -274,13 +268,14 @@ QScrollBar::handle:horizontal {{
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 
 QSplitter::handle {{ background: {C['border']}; width: 1px; height: 1px; }}
-
 QDialog {{ background: {C['card']}; border: 1px solid {C['border']}; border-radius: 10px; }}
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+PREVIEW_SIZE_LIMIT = 50 * 1024 * 1024   # 50 MB cap for in-memory preview
+
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -288,18 +283,18 @@ def get_local_ip():
         ip = s.getsockname()[0]
         s.close()
         return ip
-    except:
+    except Exception:
         return "127.0.0.1"
 
 def fmt_size(b):
-    for u in ["B","KB","MB","GB"]:
-        if b < 1024: return f"{b:.1f} {u}"
+    for u in ["B", "KB", "MB", "GB"]:
+        if b < 1024:
+            return f"{b:.1f} {u}"
         b /= 1024
     return f"{b:.1f} TB"
 
 def fmt_time(ts):
-    import datetime
-    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d  %H:%M")
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d  %H:%M")
 
 def label(text, style=""):
     l = QLabel(text)
@@ -307,13 +302,13 @@ def label(text, style=""):
     return l
 
 def hline():
-    f = QFrame(); f.setFrameShape(QFrame.HLine)
-    f.setStyleSheet(f"color: {C['border']};"); return f
-
+    f = QFrame()
+    f.setFrameShape(QFrame.HLine)
+    f.setStyleSheet(f"color: {C['border']};")
+    return f
 
 def _hash_password(password: str) -> bytes:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=13))
-
 
 def _verify_password(password: str, password_hash: bytes) -> bool:
     try:
@@ -321,13 +316,13 @@ def _verify_password(password: str, password_hash: bytes) -> bool:
     except ValueError:
         return False
 
-
-TLS_DIR = Path("certs")
-TLS_CERT_FILE = TLS_DIR / "droplink-cert.pem"
-TLS_KEY_FILE = TLS_DIR / "droplink-key.pem"
-
+TLS_DIR          = Path("certs")
+TLS_CERT_FILE    = TLS_DIR / "droplink-cert.pem"
+TLS_KEY_FILE     = TLS_DIR / "droplink-key.pem"
 DISCOVERY_SERVICE_TYPE = "_droplink._tcp.local."
 
+_trusted_server_fingerprints: dict[str, str] = {}
+_state_lock = threading.RLock()
 
 def _cert_fingerprint_sha256(cert_file: Path) -> str:
     try:
@@ -336,8 +331,35 @@ def _cert_fingerprint_sha256(cert_file: Path) -> str:
     except Exception:
         return ""
 
+def _normalize_fingerprint(fp: str) -> str:
+    return "".join(ch for ch in (fp or "").lower() if ch in "0123456789abcdef")
+
+def _authority_key(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise RuntimeError("Invalid server URL")
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    return f"{host}:{port}"
+
+def _probe_server_fingerprint(url: str, timeout: float = 5.0) -> str:
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise RuntimeError("Invalid server URL")
+    port = parsed.port or 443
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
+            der = tls_sock.getpeercert(binary_form=True)
+    if not der:
+        raise RuntimeError("Server did not provide a TLS certificate")
+    return hashlib.sha256(der).hexdigest()
 
 def _ensure_self_signed_cert(cert_file: Path, key_file: Path):
+    """Generate a self-signed TLS certificate if one doesn't exist."""
     if cert_file.exists() and key_file.exists():
         return
 
@@ -359,7 +381,8 @@ def _ensure_self_signed_cert(cert_file: Path, key_file: Path):
     except ValueError:
         pass
 
-    now = datetime.utcnow()
+    # FIX: use timezone-aware datetime instead of deprecated datetime.utcnow()
+    now = datetime.now(timezone.utc)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -380,46 +403,65 @@ def _ensure_self_signed_cert(cert_file: Path, key_file: Path):
         )
     )
     cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-
     try:
         os.chmod(key_file, 0o600)
     except OSError:
         pass
 
-
 def _safe_filename(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", Path(name or "").name)
-    return cleaned.strip("._")
-
+    # FIX: preserve leading dot for dotfiles (.env, .gitignore), only strip trailing
+    base = Path(name or "").name
+    # Keep leading dot if present (dotfile), sanitize the rest
+    if base.startswith(".") and len(base) > 1:
+        rest = re.sub(r"[^A-Za-z0-9._-]", "_", base[1:]).strip("_")
+        cleaned = f".{rest}" if rest else ""
+    else:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", base).strip("._")
+    return cleaned
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FASTAPI BACKEND (runs in a thread)
 # ══════════════════════════════════════════════════════════════════════════════
 SYNC_FOLDER = Path("synced")
 SYNC_FOLDER.mkdir(exist_ok=True)
-_api_app = FastAPI(title="Droplink API", version="2.0")
+
 _server_state = {
     "password_hash": _hash_password("dropbox123"),
-    "tokens": {},          # token -> expiry
-    "log_cb": None,        # callable(msg) — GUI log callback
-    "clients": {},         # ip -> last_seen timestamp
+    "tokens":  {},       # token -> expiry
+    "log_cb":  None,     # callable(msg) — GUI log callback
+    "clients": {},       # ip -> last_seen timestamp
 }
+
+# FIX: server-ready callback invoked from FastAPI startup event (not before uvicorn binds)
+_server_ready_callback: Optional[callable] = None
+
+@asynccontextmanager
+async def _lifespan(app):
+    """FastAPI lifespan: fires callback AFTER server is bound and accepting connections."""
+    global _server_ready_callback
+    cb = _server_ready_callback
+    if cb:
+        cb()
+    yield
+    # shutdown — nothing to clean up here
+
+_api_app = FastAPI(title="Droplink API", version="2.0", lifespan=_lifespan)
 
 
 class LoginPayload(BaseModel):
     password: str = ""
 
 
-def _log(msg):
+def _log(msg: str):
     ts = time.strftime("%H:%M:%S")
     full = f"[{ts}]  {msg}"
-    if _server_state["log_cb"]:
-        _server_state["log_cb"](full)
-
+    with _state_lock:
+        log_cb = _server_state["log_cb"]
+    if log_cb:
+        log_cb(full)
 
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
-
 
 def _resolve_within_sync(path_str: str) -> Path:
     root = SYNC_FOLDER.resolve()
@@ -430,60 +472,60 @@ def _resolve_within_sync(path_str: str) -> Path:
         raise HTTPException(status_code=403, detail="Forbidden path")
     return full
 
-
 def _require_auth(
     request: Request,
     x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
 ) -> str:
     tok = (x_auth_token or "").strip()
-    if tok not in _server_state["tokens"]:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if time.time() > _server_state["tokens"][tok]:
-        _server_state["tokens"].pop(tok, None)
-        raise HTTPException(status_code=401, detail="Session expired")
-    _server_state["clients"][_client_ip(request)] = time.time()
+    with _state_lock:
+        if tok not in _server_state["tokens"]:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        if time.time() > _server_state["tokens"][tok]:
+            _server_state["tokens"].pop(tok, None)
+            raise HTTPException(status_code=401, detail="Session expired")
+        _server_state["clients"][_client_ip(request)] = time.time()
     return tok
 
 
 @_api_app.get("/ping")
-async def _ping():
+async def api_ping():
     return {"status": "ok", "version": "2.0"}
 
-
 @_api_app.post("/login")
-async def _login(data: LoginPayload, request: Request):
-    if not _verify_password(data.password, _server_state["password_hash"]):
+async def api_login(data: LoginPayload, request: Request):
+    with _state_lock:
+        password_hash = _server_state["password_hash"]
+    if not _verify_password(data.password, password_hash):
         _log(f"❌  Failed login from {_client_ip(request)}")
         raise HTTPException(status_code=403, detail="Invalid password")
     tok = secrets.token_hex(24)
-    _server_state["tokens"][tok] = time.time() + 86400
+    with _state_lock:
+        _server_state["tokens"][tok] = time.time() + 86400
     _log(f"✅  Client connected: {_client_ip(request)}")
     return {"token": tok}
 
-
 @_api_app.post("/logout")
-async def _logout(request: Request, tok: str = Depends(_require_auth)):
-    _server_state["tokens"].pop(tok, None)
+async def api_logout(request: Request, tok: str = Depends(_require_auth)):
+    with _state_lock:
+        _server_state["tokens"].pop(tok, None)
     _log(f"👋  Client disconnected: {_client_ip(request)}")
     return {"status": "ok"}
 
-
 @_api_app.get("/files")
-async def _files(_tok: str = Depends(_require_auth)):
+async def api_files(_tok: str = Depends(_require_auth)):
     out = []
     for p in SYNC_FOLDER.rglob("*"):
         if p.is_file():
             st = p.stat()
             out.append({
-                "name": str(p.relative_to(SYNC_FOLDER)),
-                "size": st.st_size,
+                "name":     str(p.relative_to(SYNC_FOLDER)),
+                "size":     st.st_size,
                 "modified": st.st_mtime,
             })
     return {"files": out}
 
-
 @_api_app.post("/upload")
-async def _upload(
+async def api_upload(
     request: Request,
     _tok: str = Depends(_require_auth),
     file: UploadFile = File(...),
@@ -492,11 +534,9 @@ async def _upload(
     name = _safe_filename(file.filename or "")
     if not name:
         raise HTTPException(status_code=400, detail="Invalid filename")
-
     relative_dest = str(Path(path) / name) if path else name
     dest = _resolve_within_sync(relative_dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-
     with dest.open("wb") as out:
         while True:
             chunk = await file.read(1024 * 1024)
@@ -504,13 +544,11 @@ async def _upload(
                 break
             out.write(chunk)
     await file.close()
-
     _log(f"↑  Uploaded: {name}  ({fmt_size(dest.stat().st_size)})  from {_client_ip(request)}")
     return {"status": "ok", "file": name}
 
-
 @_api_app.get("/download/{fp:path}")
-async def _download(fp: str, request: Request, _tok: str = Depends(_require_auth)):
+async def api_download(fp: str, request: Request, _tok: str = Depends(_require_auth)):
     full = _resolve_within_sync(fp)
     if not full.is_file():
         raise HTTPException(status_code=404, detail="Not found")
@@ -522,18 +560,16 @@ async def _download(fp: str, request: Request, _tok: str = Depends(_require_auth
         filename=full.name,
     )
 
-
 @_api_app.get("/preview/{fp:path}")
-async def _preview(fp: str, _tok: str = Depends(_require_auth)):
+async def api_preview(fp: str, _tok: str = Depends(_require_auth)):
     full = _resolve_within_sync(fp)
     if not full.is_file():
         raise HTTPException(status_code=404, detail="Not found")
     mime, _ = mimetypes.guess_type(str(full))
     return FileResponse(path=str(full), media_type=mime or "application/octet-stream")
 
-
 @_api_app.delete("/delete/{fp:path}")
-async def _delete(fp: str, request: Request, _tok: str = Depends(_require_auth)):
+async def api_delete(fp: str, request: Request, _tok: str = Depends(_require_auth)):
     full = _resolve_within_sync(fp)
     if not full.is_file():
         raise HTTPException(status_code=404, detail="Not found")
@@ -542,22 +578,29 @@ async def _delete(fp: str, request: Request, _tok: str = Depends(_require_auth))
     return {"status": "ok"}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  UVICORN THREAD
+# ══════════════════════════════════════════════════════════════════════════════
 class UvicornThread(QThread):
     started_ok = pyqtSignal()
-    failed = pyqtSignal(str)
+    failed     = pyqtSignal(str)
 
-    def __init__(self, port=5000):
+    def __init__(self, port: int = 5000):
         super().__init__()
-        self.port = port
-        self._server = None
+        self.port      = port
+        self._server   = None
         self.cert_file = TLS_CERT_FILE
-        self.key_file = TLS_KEY_FILE
+        self.key_file  = TLS_KEY_FILE
 
     def run(self):
         import logging
-
         logging.getLogger("uvicorn.error").setLevel(logging.ERROR)
         logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
+
+        global _server_ready_callback
+        # FIX: set the callback BEFORE run() so the lifespan hook fires it
+        # after the server is actually bound and accepting connections
+        _server_ready_callback = self.started_ok.emit
 
         try:
             _ensure_self_signed_cert(self.cert_file, self.key_file)
@@ -571,19 +614,20 @@ class UvicornThread(QThread):
                 ssl_keyfile=str(self.key_file),
             )
             self._server = uvicorn.Server(config)
-            self.started_ok.emit()
-            self._server.run()
+            self._server.run()          # blocks until stopped
         except Exception as e:
             self.failed.emit(str(e))
         finally:
+            _server_ready_callback = None
             self._server = None
 
     def stop(self):
         if self._server is not None:
             self._server.should_exit = True
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  WORKER THREADS (client side)
+#  API REQUEST HELPER (client side, handles TLS pinning)
 # ══════════════════════════════════════════════════════════════════════════════
 import requests as _req
 import urllib3
@@ -592,45 +636,85 @@ from urllib3.exceptions import InsecureRequestWarning
 urllib3.disable_warnings(InsecureRequestWarning)
 
 
-def _api_request(method, url, **kwargs):
+def _api_request(
+    method: str,
+    url: str,
+    *,
+    expected_fingerprint: Optional[str] = None,
+    allow_untrusted: bool = False,
+    **kwargs,
+):
+    """Thin wrapper around requests that performs cert-pinning for HTTPS URLs."""
     if url.lower().startswith("https://"):
+        authority        = _authority_key(url)
+        raw_timeout      = kwargs.get("timeout", 5)
+        connect_timeout  = (raw_timeout[0] if isinstance(raw_timeout, (tuple, list))
+                            else float(raw_timeout or 5))
+        try:
+            observed_fp = _probe_server_fingerprint(url, connect_timeout)
+        except Exception as e:
+            raise RuntimeError(f"TLS handshake failed: {e}")
+
+        provided_fp = _normalize_fingerprint(expected_fingerprint or "")
+        pinned_fp   = _normalize_fingerprint(
+            _trusted_server_fingerprints.get(authority, ""))
+        required_fp = provided_fp or pinned_fp
+
+        if required_fp:
+            if observed_fp != required_fp:
+                raise RuntimeError(
+                    "Server certificate fingerprint mismatch — "
+                    "possible MITM attack or cert was regenerated.")
+            _trusted_server_fingerprints[authority] = required_fp
+        else:
+            if not allow_untrusted:
+                raise RuntimeError(
+                    "Untrusted server certificate. "
+                    "Connect once to pin the certificate.")
+            # First-time trust-on-first-use: remember for the session
+            _trusted_server_fingerprints[authority] = observed_fp
+
         kwargs.setdefault("verify", False)
+
     return _req.request(method, url, **kwargs)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  ZEROCONF / mDNS
+# ══════════════════════════════════════════════════════════════════════════════
 class ZeroconfAdvertiser:
     def __init__(self, *, local_ip: str, port: int, fingerprint: str):
-        self.local_ip = local_ip
-        self.port = port
+        self.local_ip    = local_ip
+        self.port        = port
         self.fingerprint = fingerprint
-        self._zeroconf = None
-        self._service_info = None
+        self._zeroconf   = None
+        self._info       = None
 
     def start(self):
         host = socket.gethostname() or "droplink"
-        service_name = f"Droplink-{host}-{self.port}.{DISCOVERY_SERVICE_TYPE}"
-        properties = {
-            "name": host,
+        name = f"Droplink-{host}-{self.port}.{DISCOVERY_SERVICE_TYPE}"
+        props = {
+            "name":  host,
             "proto": "https",
-            "ver": "2",
-            "fp": self.fingerprint,
+            "ver":   "2",
+            "fp":    self.fingerprint,
         }
-        encoded_props = {k.encode("utf-8"): v.encode("utf-8") for k, v in properties.items()}
-        self._service_info = ServiceInfo(
+        encoded = {k.encode(): v.encode() for k, v in props.items()}
+        self._info = ServiceInfo(
             type_=DISCOVERY_SERVICE_TYPE,
-            name=service_name,
+            name=name,
             addresses=[socket.inet_aton(self.local_ip)],
             port=self.port,
-            properties=encoded_props,
+            properties=encoded,
             server=f"{host}.local.",
         )
         self._zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
-        self._zeroconf.register_service(self._service_info)
+        self._zeroconf.register_service(self._info)
 
     def stop(self):
         try:
-            if self._zeroconf and self._service_info:
-                self._zeroconf.unregister_service(self._service_info)
+            if self._zeroconf and self._info:
+                self._zeroconf.unregister_service(self._info)
         except Exception:
             pass
         try:
@@ -638,8 +722,7 @@ class ZeroconfAdvertiser:
                 self._zeroconf.close()
         except Exception:
             pass
-        self._service_info = None
-        self._zeroconf = None
+        self._info = self._zeroconf = None
 
 
 class _DiscoveryListener(ServiceListener):
@@ -659,21 +742,22 @@ class _DiscoveryListener(ServiceListener):
 class DiscoveryBrowserThread(QThread):
     service_upsert = pyqtSignal(object)
     service_remove = pyqtSignal(str)
-    status = pyqtSignal(str)
+    status         = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self._running = True
-        self._zeroconf = None
-        self._browser = None
+        self._running   = True
+        self._zeroconf  = None
+        self._browser   = None
 
     def run(self):
         self._running = True
         try:
             self._zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
             listener = _DiscoveryListener(self)
-            self._browser = ServiceBrowser(self._zeroconf, DISCOVERY_SERVICE_TYPE, listener)
-            self.status.emit("Scanning LAN for Droplink servers...")
+            self._browser = ServiceBrowser(
+                self._zeroconf, DISCOVERY_SERVICE_TYPE, listener)
+            self.status.emit("Scanning LAN for Droplink servers…")
             while self._running:
                 self.msleep(200)
         except Exception as e:
@@ -689,8 +773,7 @@ class DiscoveryBrowserThread(QThread):
                     self._zeroconf.close()
             except Exception:
                 pass
-            self._browser = None
-            self._zeroconf = None
+            self._browser = self._zeroconf = None
 
     def stop(self):
         self._running = False
@@ -698,49 +781,55 @@ class DiscoveryBrowserThread(QThread):
     def _emit_service(self, service_name: str):
         if not self._zeroconf:
             return
-        info = self._zeroconf.get_service_info(DISCOVERY_SERVICE_TYPE, service_name, timeout=2000)
+        info = self._zeroconf.get_service_info(
+            DISCOVERY_SERVICE_TYPE, service_name, timeout=2000)
         if not info or not info.addresses:
             return
-        ip = socket.inet_ntoa(info.addresses[0])
+        ip    = socket.inet_ntoa(info.addresses[0])
         props = {}
         for k, v in (info.properties or {}).items():
             key = k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k)
             val = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
             props[key] = val
-
-        proto = props.get("proto", "https")
-        url = f"{proto}://{ip}:{info.port}"
+        proto   = props.get("proto", "https")
+        url     = f"{proto}://{ip}:{info.port}"
         display = f"{props.get('name', 'Droplink')} ({ip}:{info.port})"
-        self.service_upsert.emit(
-            {
-                "id": service_name,
-                "display": display,
-                "url": url,
-                "fingerprint": props.get("fp", ""),
-            }
-        )
+        self.service_upsert.emit({
+            "id":          service_name,
+            "display":     display,
+            "url":         url,
+            "fingerprint": props.get("fp", ""),
+        })
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLIENT WORKER THREADS
+# ══════════════════════════════════════════════════════════════════════════════
 class UploadWorker(QThread):
     progress = pyqtSignal(int)
-    done = pyqtSignal(bool, str)
-    def __init__(self, srv, tok, path):
-        super().__init__(); self.srv=srv; self.tok=tok; self.path=path
+    done     = pyqtSignal(bool, str)
+
+    def __init__(self, srv: str, tok: str, path: str):
+        super().__init__()
+        self.srv  = srv
+        self.tok  = tok
+        self.path = path
+
     def run(self):
         try:
-            size = os.path.getsize(self.path)
-            name = os.path.basename(self.path)
+            size     = os.path.getsize(self.path)
+            name     = os.path.basename(self.path)
             uploaded = [0]
-            this = self
+            this     = self
 
             with open(self.path, "rb") as orig:
-                class Wrapped:
+                class _Wrapped:
                     def read(self_, n=-1):
                         chunk = orig.read(n)
                         uploaded[0] += len(chunk)
                         if size:
                             this.progress.emit(int(uploaded[0] / size * 100))
                         return chunk
-
                     def __getattr__(self_, k):
                         return getattr(orig, k)
 
@@ -748,68 +837,166 @@ class UploadWorker(QThread):
                     "POST",
                     f"{self.srv}/upload",
                     headers={"X-Auth-Token": self.tok},
-                    files={"file": (name, Wrapped())},
+                    files={"file": (name, _Wrapped())},
                     timeout=120,
+                    # rely on fingerprint pinned at login time
                 )
 
             if r.ok:
                 self.done.emit(True, name)
             else:
                 self.done.emit(False, f"{name} (HTTP {r.status_code})")
-        except Exception as e: self.done.emit(False, str(e))
+        except Exception as e:
+            self.done.emit(False, str(e))
+
 
 class DownloadWorker(QThread):
     progress = pyqtSignal(int)
-    done = pyqtSignal(bool, str)
-    def __init__(self, srv, tok, rp, sp):
-        super().__init__(); self.srv=srv; self.tok=tok; self.rp=rp; self.sp=sp
+    done     = pyqtSignal(bool, str)
+
+    def __init__(self, srv: str, tok: str, rp: str, sp: str):
+        super().__init__()
+        self.srv = srv
+        self.tok = tok
+        self.rp  = rp
+        self.sp  = sp
+
     def run(self):
         try:
-            r = _api_request("GET", f"{self.srv}/download/{self.rp}",
-                headers={"X-Auth-Token":self.tok}, stream=True, timeout=120)
+            r = _api_request(
+                "GET",
+                f"{self.srv}/download/{self.rp}",
+                headers={"X-Auth-Token": self.tok},
+                stream=True,
+                timeout=120,
+            )
             if not r.ok:
                 self.done.emit(False, f"HTTP {r.status_code}")
                 return
-            total = int(r.headers.get("content-length",0))
-            done = 0
-            with open(self.sp,"wb") as f:
+            total = int(r.headers.get("content-length", 0))
+            done  = 0
+            with open(self.sp, "wb") as f:
                 for chunk in r.iter_content(65536):
                     if chunk:
-                        f.write(chunk); done+=len(chunk)
-                        if total: self.progress.emit(int(done/total*100))
-            self.done.emit(r.status_code==200, self.sp)
-        except Exception as e: self.done.emit(False, str(e))
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            self.progress.emit(int(done / total * 100))
+            # FIX: emit True explicitly — r.ok was already verified above
+            self.done.emit(True, self.sp)
+        except Exception as e:
+            self.done.emit(False, str(e))
+
 
 class PreviewWorker(QThread):
-    done = pyqtSignal(bytes, str)  # data, mime
+    done  = pyqtSignal(bytes, str)   # data, mime
     error = pyqtSignal(str)
-    def __init__(self, srv, tok, rp):
-        super().__init__(); self.srv=srv; self.tok=tok; self.rp=rp
+
+    def __init__(self, srv: str, tok: str, rp: str):
+        super().__init__()
+        self.srv = srv
+        self.tok = tok
+        self.rp  = rp
+
     def run(self):
         try:
-            r = _api_request("GET", f"{self.srv}/preview/{self.rp}",
-                headers={"X-Auth-Token":self.tok}, timeout=30)
+            r = _api_request(
+                "GET",
+                f"{self.srv}/preview/{self.rp}",
+                headers={"X-Auth-Token": self.tok},
+                stream=True,       # FIX: stream so we can check size before loading all
+                timeout=30,
+            )
             if not r.ok:
                 self.error.emit(f"HTTP {r.status_code}")
                 return
-            mime = r.headers.get("content-type","").split(";")[0]
-            self.done.emit(r.content, mime)
-        except Exception as e: self.error.emit(str(e))
+
+            # FIX: enforce PREVIEW_SIZE_LIMIT — don't load huge files into RAM
+            content_length = int(r.headers.get("content-length", 0))
+            if content_length > PREVIEW_SIZE_LIMIT:
+                self.error.emit(
+                    f"File too large to preview ({fmt_size(content_length)}).\n"
+                    f"Limit is {fmt_size(PREVIEW_SIZE_LIMIT)}. Download to view.")
+                return
+
+            chunks = []
+            received = 0
+            for chunk in r.iter_content(65536):
+                if chunk:
+                    received += len(chunk)
+                    if received > PREVIEW_SIZE_LIMIT:
+                        self.error.emit(
+                            f"File exceeded preview limit ({fmt_size(PREVIEW_SIZE_LIMIT)}).")
+                        return
+                    chunks.append(chunk)
+
+            mime = r.headers.get("content-type", "").split(";")[0].strip()
+            self.done.emit(b"".join(chunks), mime)
+        except Exception as e:
+            self.error.emit(str(e))
+
 
 class FileFetchWorker(QThread):
     result = pyqtSignal(list)
     error  = pyqtSignal(str)
-    def __init__(self, srv, tok):
-        super().__init__(); self.srv=srv; self.tok=tok
+
+    def __init__(self, srv: str, tok: str):
+        super().__init__()
+        self.srv = srv
+        self.tok = tok
+
     def run(self):
         try:
-            r = _api_request("GET", f"{self.srv}/files",
-                headers={"X-Auth-Token":self.tok}, timeout=8)
+            r = _api_request(
+                "GET",
+                f"{self.srv}/files",
+                headers={"X-Auth-Token": self.tok},
+                timeout=8,
+            )
             if not r.ok:
                 self.error.emit(f"HTTP {r.status_code}")
                 return
-            self.result.emit(r.json().get("files",[]))
-        except Exception as e: self.error.emit(str(e))
+            self.result.emit(r.json().get("files", []))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# FIX: LoginWorker runs the network request off the GUI thread to avoid freezes
+class LoginWorker(QThread):
+    success = pyqtSignal(str, str, str)   # server, token, fingerprint
+    failure = pyqtSignal(str)             # error message
+
+    def __init__(self, srv: str, pw: str, pin_fp: str, allow_untrusted: bool):
+        super().__init__()
+        self.srv            = srv
+        self.pw             = pw
+        self.pin_fp         = pin_fp
+        self.allow_untrusted = allow_untrusted
+
+    def run(self):
+        try:
+            r = _api_request(
+                "POST",
+                f"{self.srv}/login",
+                json={"password": self.pw},
+                timeout=5,
+                expected_fingerprint=self.pin_fp or None,
+                allow_untrusted=self.allow_untrusted,
+            )
+            if r.status_code == 200:
+                authority   = _authority_key(self.srv)
+                learned_fp  = _normalize_fingerprint(
+                    _trusted_server_fingerprints.get(authority, ""))
+                self.success.emit(self.srv, r.json()["token"], learned_fp)
+            elif r.status_code == 403:
+                self.failure.emit("✗  Invalid password")
+            else:
+                self.failure.emit(f"✗  Login failed (HTTP {r.status_code})")
+        except RuntimeError as e:
+            self.failure.emit(f"✗  {e}")
+        except Exception as e:
+            self.failure.emit(f"✗  Cannot reach server ({e})")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LAUNCHER SCREEN
@@ -823,15 +1010,19 @@ class LauncherWidget(QWidget):
         root = QVBoxLayout(self)
         root.setAlignment(Qt.AlignCenter)
         root.setSpacing(0)
-        root.setContentsMargins(0,0,0,0)
+        root.setContentsMargins(0, 0, 0, 0)
 
-        wrap = QWidget(); wrap.setFixedWidth(560)
-        wl = QVBoxLayout(wrap); wl.setSpacing(32); wl.setContentsMargins(40,60,40,60)
+        wrap = QWidget()
+        wrap.setFixedWidth(560)
+        wl = QVBoxLayout(wrap)
+        wl.setSpacing(32)
+        wl.setContentsMargins(40, 60, 40, 60)
 
         # Header
         icon_lbl = label("◈", f"font-size:52px;color:{C['accent']};")
         icon_lbl.setAlignment(Qt.AlignCenter)
-        title_lbl = label("DROPLINK", f"font-size:32px;font-weight:bold;color:{C['accent']};letter-spacing:6px;")
+        title_lbl = label("DROPLINK",
+            f"font-size:32px;font-weight:bold;color:{C['accent']};letter-spacing:6px;")
         title_lbl.setAlignment(Qt.AlignCenter)
         sub_lbl = label("LOCAL FILE SYNC  ·  v2.0",
             f"font-size:11px;color:{C['muted']};letter-spacing:3px;")
@@ -842,14 +1033,13 @@ class LauncherWidget(QWidget):
         wl.addWidget(sub_lbl)
         wl.addWidget(hline())
 
-        # Mode label
         mode_lbl = label("SELECT MODE",
             f"font-size:10px;color:{C['muted']};letter-spacing:3px;")
         mode_lbl.setAlignment(Qt.AlignCenter)
         wl.addWidget(mode_lbl)
 
-        # Mode cards
-        cards = QHBoxLayout(); cards.setSpacing(20)
+        cards = QHBoxLayout()
+        cards.setSpacing(20)
 
         # Server card
         srv_card = QFrame()
@@ -861,16 +1051,21 @@ class LauncherWidget(QWidget):
                 padding: 10px;
             }}
         """)
-        srv_cl = QVBoxLayout(srv_card); srv_cl.setSpacing(12); srv_cl.setContentsMargins(24,28,24,28)
-        srv_cl.addWidget(label("🖥", "font-size:32px;"), alignment=Qt.AlignCenter)
-        srv_cl.addWidget(label("SERVER", f"font-size:16px;font-weight:bold;color:{C['accent2']};letter-spacing:3px;"), alignment=Qt.AlignCenter)
-        srv_cl.addWidget(label("Host & share files\non your machine",
-            f"font-size:11px;color:{C['muted']};text-align:center;"), alignment=Qt.AlignCenter)
+        scl = QVBoxLayout(srv_card)
+        scl.setSpacing(12)
+        scl.setContentsMargins(24, 28, 24, 28)
+        scl.addWidget(label("🖥", "font-size:32px;"), alignment=Qt.AlignCenter)
+        scl.addWidget(label("SERVER",
+            f"font-size:16px;font-weight:bold;color:{C['accent2']};letter-spacing:3px;"),
+            alignment=Qt.AlignCenter)
+        scl.addWidget(label("Host & share files\non your machine",
+            f"font-size:11px;color:{C['muted']};text-align:center;"),
+            alignment=Qt.AlignCenter)
         srv_btn = QPushButton("START SERVER")
         srv_btn.setObjectName("btn_server")
         srv_btn.setFixedHeight(44)
         srv_btn.clicked.connect(self.chose_server)
-        srv_cl.addWidget(srv_btn)
+        scl.addWidget(srv_btn)
 
         # Client card
         cli_card = QFrame()
@@ -882,16 +1077,21 @@ class LauncherWidget(QWidget):
                 padding: 10px;
             }}
         """)
-        cli_cl = QVBoxLayout(cli_card); cli_cl.setSpacing(12); cli_cl.setContentsMargins(24,28,24,28)
-        cli_cl.addWidget(label("💻", "font-size:32px;"), alignment=Qt.AlignCenter)
-        cli_cl.addWidget(label("CLIENT", f"font-size:16px;font-weight:bold;color:{C['accent']};letter-spacing:3px;"), alignment=Qt.AlignCenter)
-        cli_cl.addWidget(label("Connect to a server\nand sync files",
-            f"font-size:11px;color:{C['muted']};text-align:center;"), alignment=Qt.AlignCenter)
+        ccl = QVBoxLayout(cli_card)
+        ccl.setSpacing(12)
+        ccl.setContentsMargins(24, 28, 24, 28)
+        ccl.addWidget(label("💻", "font-size:32px;"), alignment=Qt.AlignCenter)
+        ccl.addWidget(label("CLIENT",
+            f"font-size:16px;font-weight:bold;color:{C['accent']};letter-spacing:3px;"),
+            alignment=Qt.AlignCenter)
+        ccl.addWidget(label("Connect to a server\nand sync files",
+            f"font-size:11px;color:{C['muted']};text-align:center;"),
+            alignment=Qt.AlignCenter)
         cli_btn = QPushButton("CONNECT")
         cli_btn.setObjectName("btn_client")
         cli_btn.setFixedHeight(44)
         cli_btn.clicked.connect(self.chose_client)
-        cli_cl.addWidget(cli_btn)
+        ccl.addWidget(cli_btn)
 
         cards.addWidget(srv_card)
         cards.addWidget(cli_card)
@@ -904,88 +1104,102 @@ class LauncherWidget(QWidget):
 
         root.addWidget(wrap, alignment=Qt.AlignCenter)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SERVER SCREEN
 # ══════════════════════════════════════════════════════════════════════════════
 class ServerWidget(QWidget):
-    go_back = pyqtSignal()
+    server_log = pyqtSignal(str)
+    go_back    = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self._server_thread = None
+        self._server_thread       = None
         self._discovery_advertiser = None
-        self._running = False
-        self._folder_btn = None
-        self._workers = []
+        self._running             = False
+        self._folder_btn          = None
+        self.server_log.connect(self._append_log)
         self._build_ui()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setSpacing(0)
-        root.setContentsMargins(0,0,0,0)
+        root.setContentsMargins(0, 0, 0, 0)
 
         # ── Top bar ──
-        bar = QFrame(); bar.setFixedHeight(58)
-        bar.setStyleSheet(f"background:{C['panel']};border-bottom:1px solid {C['border']};")
-        bl = QHBoxLayout(bar); bl.setContentsMargins(20,0,20,0)
+        bar = QFrame()
+        bar.setFixedHeight(58)
+        bar.setStyleSheet(
+            f"background:{C['panel']};border-bottom:1px solid {C['border']};")
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(20, 0, 20, 0)
         back_btn = QPushButton("← BACK")
         back_btn.setObjectName("btn_subtle")
-        back_btn.setFixedSize(90,32)
+        back_btn.setFixedSize(90, 32)
         back_btn.clicked.connect(self._confirm_back)
         bl.addWidget(back_btn)
         bl.addWidget(label("SERVER MODE",
             f"font-size:13px;font-weight:bold;color:{C['accent2']};letter-spacing:3px;"))
         bl.addStretch()
-        self._status_dot = label("● OFFLINE", f"font-size:11px;color:{C['danger']};letter-spacing:1px;")
+        self._status_dot = label("● OFFLINE",
+            f"font-size:11px;color:{C['danger']};letter-spacing:1px;")
         bl.addWidget(self._status_dot)
         root.addWidget(bar)
 
         # ── Body ──
         body = QWidget()
-        bl2 = QHBoxLayout(body); bl2.setSpacing(0); bl2.setContentsMargins(0,0,0,0)
+        bl2  = QHBoxLayout(body)
+        bl2.setSpacing(0)
+        bl2.setContentsMargins(0, 0, 0, 0)
 
-        # LEFT PANEL — config + stats
-        left = QWidget(); left.setFixedWidth(280)
-        left.setStyleSheet(f"background:{C['panel']};border-right:1px solid {C['border']};")
-        ll = QVBoxLayout(left); ll.setSpacing(16); ll.setContentsMargins(20,20,20,20)
+        # LEFT: config + stats
+        left = QWidget()
+        left.setFixedWidth(280)
+        left.setStyleSheet(
+            f"background:{C['panel']};border-right:1px solid {C['border']};")
+        ll = QVBoxLayout(left)
+        ll.setSpacing(16)
+        ll.setContentsMargins(20, 20, 20, 20)
 
         ll.addWidget(label("CONFIGURATION",
             f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
 
-        # Port
         ll.addWidget(label("Port", f"font-size:11px;color:{C['muted']};"))
         self._port_input = QLineEdit("5000")
         self._port_input.setValidator(QIntValidator(1, 65535, self))
-        self._port_input.setPlaceholderText("1 - 65535")
+        self._port_input.setPlaceholderText("1 – 65535")
         ll.addWidget(self._port_input)
 
-        # Password
         ll.addWidget(label("Password", f"font-size:11px;color:{C['muted']};"))
-        pw_row = QHBoxLayout(); pw_row.setSpacing(6)
+        pw_row = QHBoxLayout()
+        pw_row.setSpacing(6)
         self._pw_input = QLineEdit("dropbox123")
         self._pw_input.setEchoMode(QLineEdit.Password)
-        self._show_pw = QPushButton("👁"); self._show_pw.setFixedSize(36,36)
+        self._show_pw  = QPushButton("👁")
+        self._show_pw.setFixedSize(36, 36)
         self._show_pw.setObjectName("btn_field")
         self._show_pw.setCheckable(True)
         self._show_pw.toggled.connect(lambda c: self._pw_input.setEchoMode(
             QLineEdit.Normal if c else QLineEdit.Password))
-        pw_row.addWidget(self._pw_input); pw_row.addWidget(self._show_pw)
+        pw_row.addWidget(self._pw_input)
+        pw_row.addWidget(self._show_pw)
         ll.addLayout(pw_row)
 
-        # Sync folder
         ll.addWidget(label("Sync Folder", f"font-size:11px;color:{C['muted']};"))
-        fol_row = QHBoxLayout(); fol_row.setSpacing(6)
+        fol_row = QHBoxLayout()
+        fol_row.setSpacing(6)
         self._folder_input = QLineEdit(str(SYNC_FOLDER.resolve()))
         self._folder_input.setReadOnly(True)
-        self._folder_btn = QPushButton("…"); self._folder_btn.setFixedSize(36,36)
+        self._folder_btn = QPushButton("…")
+        self._folder_btn.setFixedSize(36, 36)
         self._folder_btn.setObjectName("btn_field")
         self._folder_btn.clicked.connect(self._pick_folder)
-        fol_row.addWidget(self._folder_input); fol_row.addWidget(self._folder_btn)
+        fol_row.addWidget(self._folder_input)
+        fol_row.addWidget(self._folder_btn)
         ll.addLayout(fol_row)
 
         ll.addWidget(hline())
 
-        # Start/Stop
         self._start_btn = QPushButton("▶  START SERVER")
         self._start_btn.setObjectName("btn_accent")
         self._start_btn.setFixedHeight(42)
@@ -1004,30 +1218,36 @@ class ServerWidget(QWidget):
         ll.addWidget(label("SERVER INFO",
             f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
 
-        self._info_local  = label("Local:  —", f"font-size:11px;color:{C['text']};")
-        self._info_net    = label("Network:  —", f"font-size:11px;color:{C['text']};")
+        self._info_local   = label("Local:    —", f"font-size:11px;color:{C['text']};")
+        self._info_net     = label("Network:  —", f"font-size:11px;color:{C['text']};")
         self._info_clients = label("Clients:  0", f"font-size:11px;color:{C['muted']};")
-        self._info_files  = label("Files:  0", f"font-size:11px;color:{C['muted']};")
-        for w in [self._info_local,self._info_net,self._info_clients,self._info_files]:
+        self._info_files   = label("Files:    0", f"font-size:11px;color:{C['muted']};")
+        for w in [self._info_local, self._info_net,
+                  self._info_clients, self._info_files]:
             ll.addWidget(w)
 
         ll.addStretch()
 
-        # RIGHT PANEL — logs + file list
+        # RIGHT: log + file list
         right = QWidget()
-        rl = QVBoxLayout(right); rl.setSpacing(0); rl.setContentsMargins(0,0,0,0)
+        rl    = QVBoxLayout(right)
+        rl.setSpacing(0)
+        rl.setContentsMargins(0, 0, 0, 0)
 
         splitter = QSplitter(Qt.Vertical)
 
         # Log panel
         log_panel = QWidget()
         log_panel.setStyleSheet(f"background:{C['bg']};")
-        lpl = QVBoxLayout(log_panel); lpl.setSpacing(8); lpl.setContentsMargins(16,14,16,14)
+        lpl = QVBoxLayout(log_panel)
+        lpl.setSpacing(8)
+        lpl.setContentsMargins(16, 14, 16, 14)
         log_hdr = QHBoxLayout()
         log_hdr.addWidget(label("ACTIVITY LOG",
             f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
         log_hdr.addStretch()
-        clr_btn = QPushButton("CLEAR"); clr_btn.setFixedSize(60,24)
+        clr_btn = QPushButton("CLEAR")
+        clr_btn.setFixedSize(60, 24)
         clr_btn.setObjectName("btn_subtle")
         clr_btn.clicked.connect(lambda: self._log_box.clear())
         log_hdr.addWidget(clr_btn)
@@ -1040,20 +1260,24 @@ class ServerWidget(QWidget):
         # File panel
         file_panel = QWidget()
         file_panel.setStyleSheet(f"background:{C['bg']};")
-        fpl = QVBoxLayout(file_panel); fpl.setSpacing(8); fpl.setContentsMargins(16,14,16,14)
+        fpl = QVBoxLayout(file_panel)
+        fpl.setSpacing(8)
+        fpl.setContentsMargins(16, 14, 16, 14)
         file_hdr = QHBoxLayout()
         file_hdr.addWidget(label("SYNCED FILES",
             f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
         file_hdr.addStretch()
-        ref_btn = QPushButton("⟳"); ref_btn.setFixedSize(28,24)
+        ref_btn = QPushButton("⟳")
+        ref_btn.setFixedSize(28, 24)
         ref_btn.setObjectName("btn_icon")
         ref_btn.clicked.connect(self._refresh_server_files)
         file_hdr.addWidget(ref_btn)
         self._srv_file_table = QTableWidget()
         self._srv_file_table.setColumnCount(3)
-        self._srv_file_table.setHorizontalHeaderLabels(["FILENAME","SIZE","MODIFIED"])
+        self._srv_file_table.setHorizontalHeaderLabels(["FILENAME", "SIZE", "MODIFIED"])
         self._srv_file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._srv_file_table.setColumnWidth(1,90); self._srv_file_table.setColumnWidth(2,160)
+        self._srv_file_table.setColumnWidth(1, 90)
+        self._srv_file_table.setColumnWidth(2, 160)
         self._srv_file_table.verticalHeader().setVisible(False)
         self._srv_file_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._srv_file_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1063,14 +1287,13 @@ class ServerWidget(QWidget):
 
         splitter.addWidget(log_panel)
         splitter.addWidget(file_panel)
-        splitter.setSizes([300,200])
+        splitter.setSizes([300, 200])
 
         rl.addWidget(splitter)
         bl2.addWidget(left)
         bl2.addWidget(right)
         root.addWidget(body)
 
-        # Stats refresh timer
         self._stats_timer = QTimer()
         self._stats_timer.timeout.connect(self._update_stats)
         self._stats_timer.start(3000)
@@ -1083,11 +1306,12 @@ class ServerWidget(QWidget):
             SYNC_FOLDER.mkdir(exist_ok=True)
             self._folder_input.setText(d)
 
-    def _set_status(self, text, color):
+    def _set_status(self, text: str, color: str):
         self._status_dot.setText(text)
-        self._status_dot.setStyleSheet(f"font-size:11px;color:{color};letter-spacing:1px;")
+        self._status_dot.setStyleSheet(
+            f"font-size:11px;color:{color};letter-spacing:1px;")
 
-    def _set_server_controls(self, enabled):
+    def _set_server_controls(self, enabled: bool):
         self._port_input.setEnabled(enabled)
         self._pw_input.setEnabled(enabled)
         self._show_pw.setEnabled(enabled)
@@ -1097,34 +1321,29 @@ class ServerWidget(QWidget):
     def _start_server(self):
         if self._running:
             return
-
         pw = self._pw_input.text().strip()
         if not pw:
             QMessageBox.warning(self, "Error", "Password cannot be empty.")
             return
         if len(pw) < 10:
-            QMessageBox.warning(self, "Error", "Use a stronger password (at least 10 characters).")
+            QMessageBox.warning(self, "Error",
+                "Use a stronger password (at least 10 characters).")
             return
 
         port_text = self._port_input.text().strip()
-        if not port_text:
-            QMessageBox.warning(self, "Error", "Enter a valid port (1-65535).")
-            return
-
         try:
             port = int(port_text)
+            if not 1 <= port <= 65535:
+                raise ValueError
         except ValueError:
-            QMessageBox.warning(self, "Error", "Port must be a number.")
+            QMessageBox.warning(self, "Error", "Enter a valid port (1–65535).")
             return
 
-        if not 1 <= port <= 65535:
-            QMessageBox.warning(self, "Error", "Port must be between 1 and 65535.")
-            return
-
-        _server_state["password_hash"] = _hash_password(pw)
-        _server_state["tokens"].clear()
-        _server_state["clients"].clear()
-        _server_state["log_cb"] = self._append_log
+        with _state_lock:
+            _server_state["password_hash"] = _hash_password(pw)
+            _server_state["tokens"].clear()
+            _server_state["clients"].clear()
+            _server_state["log_cb"] = self.server_log.emit
 
         self._server_thread = UvicornThread(port)
         self._server_thread.started_ok.connect(lambda p=port: self._on_server_started(p))
@@ -1134,13 +1353,13 @@ class ServerWidget(QWidget):
         self._set_server_controls(False)
         self._start_btn.setEnabled(False)
         self._set_status("● STARTING…", C["warn"])
-        self._append_log(f"⏳  Starting server on port {port}...")
+        self._append_log(f"⏳  Starting server on port {port}…")
         self._server_thread.start()
 
-    def _on_server_started(self, port):
+    def _on_server_started(self, port: int):
         self._running = True
         ip = get_local_ip()
-        self._info_local.setText(f"Local:  https://localhost:{port}")
+        self._info_local.setText(f"Local:    https://localhost:{port}")
         self._info_net.setText(f"Network:  https://{ip}:{port}")
         self._set_status("● ONLINE", C["success"])
         self._start_btn.hide()
@@ -1154,26 +1373,29 @@ class ServerWidget(QWidget):
                 fingerprint=_cert_fingerprint_sha256(TLS_CERT_FILE),
             )
             self._discovery_advertiser.start()
-            self._append_log("📡  mDNS discovery enabled (_droplink._tcp.local)")
+            self._append_log("📡  mDNS discovery active (_droplink._tcp.local)")
         except Exception as e:
-            self._append_log(f"⚠  mDNS discovery unavailable: {e}")
+            self._append_log(f"⚠  mDNS unavailable: {e}")
 
-        self._append_log(f"🚀  Server started on port {port}")
-        self._append_log(f"🔒  HTTPS enabled (self-signed): {TLS_CERT_FILE.resolve()}")
+        self._append_log(f"🚀  Server ready on port {port}")
+        self._append_log(f"🔒  HTTPS (self-signed): {TLS_CERT_FILE.resolve()}")
         self._append_log(f"📁  Sync folder: {SYNC_FOLDER.resolve()}")
         self._refresh_server_files()
 
-    def _on_server_failed(self, err):
+    def _on_server_failed(self, err: str):
         self._append_log(f"✗  Server failed to start: {err}")
+        self._set_server_controls(True)
+        self._start_btn.setEnabled(True)
+        self._set_status("● OFFLINE", C["danger"])
         QMessageBox.critical(self, "Server Error", f"Could not start server:\n{err}")
 
     def _on_server_stopped(self):
         self._running = False
-
         if self._discovery_advertiser:
             self._discovery_advertiser.stop()
             self._discovery_advertiser = None
-
+        with _state_lock:
+            _server_state["log_cb"] = None
         self._set_status("● OFFLINE", C["danger"])
         self._set_server_controls(True)
         self._start_btn.setEnabled(True)
@@ -1188,10 +1410,10 @@ class ServerWidget(QWidget):
             return
         self._stop_btn.setEnabled(False)
         self._set_status("● STOPPING…", C["warn"])
-        self._append_log("⏹  Stopping server...")
+        self._append_log("⏹  Stopping server…")
         self._server_thread.stop()
 
-    def _append_log(self, msg):
+    def _append_log(self, msg: str):
         self._log_box.append(
             f'<span style="color:{C["muted"]}">{msg}</span>')
         self._log_box.moveCursor(QTextCursor.End)
@@ -1199,38 +1421,37 @@ class ServerWidget(QWidget):
     def _update_stats(self):
         if not self._running:
             return
-        active = sum(1 for t in _server_state["clients"].values()
-                     if time.time()-t < 30)
+        with _state_lock:
+            client_times = list(_server_state["clients"].values())
+        active = sum(1 for t in client_times if time.time() - t < 30)
         self._info_clients.setText(f"Clients:  {active} active")
         cnt = sum(1 for p in SYNC_FOLDER.rglob("*") if p.is_file())
-        self._info_files.setText(f"Files:  {cnt}")
+        self._info_files.setText(f"Files:    {cnt}")
 
     def _refresh_server_files(self):
         files = sorted(
-            [{"name": str(p.relative_to(SYNC_FOLDER)),
-              "size": p.stat().st_size,
+            [{"name":     str(p.relative_to(SYNC_FOLDER)),
+              "size":     p.stat().st_size,
               "modified": p.stat().st_mtime}
              for p in SYNC_FOLDER.rglob("*") if p.is_file()],
-            key=lambda f: f["modified"],
-            reverse=True,
+            key=lambda f: f["modified"], reverse=True,
         )
         t = self._srv_file_table
         t.setRowCount(len(files))
-        for i,f in enumerate(files):
-            t.setItem(i,0,QTableWidgetItem(f["name"]))
+        for i, f in enumerate(files):
+            t.setItem(i, 0, QTableWidgetItem(f["name"]))
             si = QTableWidgetItem(fmt_size(f["size"]))
-            si.setTextAlignment(Qt.AlignRight|Qt.AlignVCenter)
-            t.setItem(i,1,si)
+            si.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            t.setItem(i, 1, si)
             mi = QTableWidgetItem(fmt_time(f["modified"]))
             mi.setTextAlignment(Qt.AlignCenter)
-            t.setItem(i,2,mi)
-            t.setRowHeight(i,36)
+            t.setItem(i, 2, mi)
+            t.setRowHeight(i, 36)
 
     def _confirm_back(self):
         if self._running:
             r = QMessageBox.question(
-                self,
-                "Go Back",
+                self, "Go Back",
                 "Server is running. Stop server and return to launcher?",
                 QMessageBox.Yes | QMessageBox.No,
             )
@@ -1239,39 +1460,38 @@ class ServerWidget(QWidget):
             self._stop_server()
         self.go_back.emit()
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  PREVIEW DIALOG
 # ══════════════════════════════════════════════════════════════════════════════
 class PreviewDialog(QDialog):
-    def __init__(self, filename, data, mime, parent=None):
+    def __init__(self, filename: str, data: bytes, mime: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Preview — {filename}")
         self.resize(820, 620)
         self.setModal(True)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16,16,16,16)
+        lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(12)
 
-        # Header
         hdr = QHBoxLayout()
-        hdr.addWidget(label(f"📄  {filename}",
-            f"font-size:13px;color:{C['text']};"))
+        hdr.addWidget(label(f"📄  {filename}", f"font-size:13px;color:{C['text']};"))
         hdr.addStretch()
-        hdr.addWidget(label(f"{mime}",
-            f"font-size:10px;color:{C['muted']};"))
+        hdr.addWidget(label(mime, f"font-size:10px;color:{C['muted']};"))
         lay.addLayout(hdr)
         lay.addWidget(hline())
 
-        # Content
         is_image = mime.startswith("image/")
         is_text  = mime.startswith("text/") or mime in (
-            "application/json","application/xml","application/javascript")
+            "application/json", "application/xml", "application/javascript",
+        )
 
         if is_image:
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
-            scroll.setStyleSheet(f"background:{C['panel']};border:1px solid {C['border']};border-radius:8px;")
+            scroll.setStyleSheet(
+                f"background:{C['panel']};border:1px solid {C['border']};border-radius:8px;")
             img_lbl = QLabel()
             img_lbl.setAlignment(Qt.AlignCenter)
             px = QPixmap()
@@ -1285,8 +1505,10 @@ class PreviewDialog(QDialog):
         elif is_text:
             txt = QTextEdit()
             txt.setReadOnly(True)
-            try: content = data.decode("utf-8")
-            except: content = data.decode("latin-1", errors="replace")
+            try:
+                content = data.decode("utf-8")
+            except UnicodeDecodeError:
+                content = data.decode("latin-1", errors="replace")
             txt.setPlainText(content)
             txt.setFont(QFont("Consolas", 11))
             lay.addWidget(txt)
@@ -1299,12 +1521,12 @@ class PreviewDialog(QDialog):
             info.setAlignment(Qt.AlignCenter)
             lay.addWidget(info)
 
-        # Close
         close_btn = QPushButton("CLOSE")
         close_btn.setObjectName("btn_accent")
         close_btn.setFixedHeight(38)
         close_btn.clicked.connect(self.accept)
         lay.addWidget(close_btn)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CLIENT LOGIN SCREEN
@@ -1315,17 +1537,25 @@ class ClientLoginWidget(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._settings = QSettings("Droplink", "DroplinkApp")
-        self._discovery_thread = None
-        self._discovered_services = {}
+        self._settings              = QSettings("Droplink", "DroplinkApp")
+        self._server_fingerprints   = self._load_pinned_fingerprints()
+        self._discovery_thread      = None
+        self._discovered_services   = {}
+        self._login_worker          = None    # FIX: track login worker
+
         root = QVBoxLayout(self)
-        root.setSpacing(0); root.setContentsMargins(0,0,0,0)
+        root.setSpacing(0)
+        root.setContentsMargins(0, 0, 0, 0)
 
         # Top bar
-        bar = QFrame(); bar.setFixedHeight(58)
-        bar.setStyleSheet(f"background:{C['panel']};border-bottom:1px solid {C['border']};")
-        bl = QHBoxLayout(bar); bl.setContentsMargins(20,0,20,0)
-        back = QPushButton("← BACK"); back.setFixedSize(90,32)
+        bar = QFrame()
+        bar.setFixedHeight(58)
+        bar.setStyleSheet(
+            f"background:{C['panel']};border-bottom:1px solid {C['border']};")
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(20, 0, 20, 0)
+        back = QPushButton("← BACK")
+        back.setFixedSize(90, 32)
         back.setObjectName("btn_subtle")
         back.clicked.connect(self._go_back)
         bl.addWidget(back)
@@ -1339,7 +1569,7 @@ class ClientLoginWidget(QWidget):
         center.setAlignment(Qt.AlignCenter)
 
         card = QFrame()
-        card.setFixedWidth(400)
+        card.setFixedWidth(420)
         card.setStyleSheet(f"""
             QFrame {{
                 background:{C['card']};
@@ -1347,22 +1577,28 @@ class ClientLoginWidget(QWidget):
                 border-radius:14px;
             }}
         """)
-        cl = QVBoxLayout(card); cl.setSpacing(14); cl.setContentsMargins(36,40,36,40)
+        cl = QVBoxLayout(card)
+        cl.setSpacing(14)
+        cl.setContentsMargins(36, 40, 36, 40)
 
-        cl.addWidget(label("◈", f"font-size:40px;color:{C['accent']};"), alignment=Qt.AlignCenter)
+        cl.addWidget(label("◈", f"font-size:40px;color:{C['accent']};"),
+            alignment=Qt.AlignCenter)
         cl.addWidget(label("CONNECT TO SERVER",
             f"font-size:15px;font-weight:bold;color:{C['text']};letter-spacing:2px;"),
             alignment=Qt.AlignCenter)
         cl.addWidget(hline())
 
-        cl.addWidget(label("SERVER ADDRESS", f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
+        cl.addWidget(label("SERVER ADDRESS",
+            f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
         last_server = self._settings.value("client/last_server", "https://localhost:5000")
         self._srv = QLineEdit(str(last_server))
         self._srv.setPlaceholderText("https://192.168.x.x:5000")
         cl.addWidget(self._srv)
 
-        cl.addWidget(label("DISCOVERED SERVERS", f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
-        disc_row = QHBoxLayout(); disc_row.setSpacing(8)
+        cl.addWidget(label("DISCOVERED SERVERS",
+            f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
+        disc_row = QHBoxLayout()
+        disc_row.setSpacing(8)
         self._discovered_combo = QComboBox()
         self._discovered_combo.currentIndexChanged.connect(self._on_discovered_selected)
         self._scan_btn = QPushButton("RESCAN")
@@ -1373,10 +1609,12 @@ class ClientLoginWidget(QWidget):
         disc_row.addWidget(self._scan_btn)
         cl.addLayout(disc_row)
 
-        self._discover_status = label("LAN discovery: idle", f"font-size:10px;color:{C['muted']};")
+        self._discover_status = label("LAN discovery: idle",
+            f"font-size:10px;color:{C['muted']};")
         cl.addWidget(self._discover_status)
 
-        cl.addWidget(label("PASSWORD", f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
+        cl.addWidget(label("PASSWORD",
+            f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
         self._pw = QLineEdit()
         self._pw.setEchoMode(QLineEdit.Password)
         self._pw.setPlaceholderText("Server password")
@@ -1409,10 +1647,34 @@ class ClientLoginWidget(QWidget):
         self._stop_discovery()
         self.go_back.emit()
 
+    def _load_pinned_fingerprints(self) -> dict:
+        raw = self._settings.value("client/pinned_fingerprints", "{}")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else {}
+            if isinstance(data, dict):
+                return {str(k): _normalize_fingerprint(str(v))
+                        for k, v in data.items() if v}
+        except Exception:
+            pass
+        return {}
+
+    def _save_pinned_fingerprints(self):
+        self._settings.setValue(
+            "client/pinned_fingerprints",
+            json.dumps(self._server_fingerprints))
+
+    def _selected_discovery_fingerprint(self) -> str:
+        idx = self._discovered_combo.currentIndex()
+        if idx < 0:
+            return ""
+        service_id = self._discovered_combo.itemData(idx)
+        data = self._discovered_services.get(service_id) if service_id else None
+        return _normalize_fingerprint(data.get("fingerprint", "")) if data else ""
+
     def _start_discovery(self):
         if self._discovery_thread and self._discovery_thread.isRunning():
             return
-        self._discover_status.setText("LAN discovery: scanning...")
+        self._discover_status.setText("LAN discovery: scanning…")
         self._discovery_thread = DiscoveryBrowserThread()
         self._discovery_thread.service_upsert.connect(self._on_discovered_service)
         self._discovery_thread.service_remove.connect(self._on_removed_service)
@@ -1434,7 +1696,7 @@ class ClientLoginWidget(QWidget):
         self._stop_discovery()
         self._start_discovery()
 
-    def _on_discovery_status(self, message):
+    def _on_discovery_status(self, message: str):
         self._discover_status.setText(f"LAN discovery: {message}")
 
     def _on_discovery_finished(self):
@@ -1443,91 +1705,117 @@ class ClientLoginWidget(QWidget):
 
     def _refresh_discovered_combo(self, selected_id=None):
         self._discovered_combo.blockSignals(True)
-        current_id = selected_id if selected_id is not None else self._discovered_combo.currentData()
+        current_id = selected_id if selected_id is not None \
+            else self._discovered_combo.currentData()
         self._discovered_combo.clear()
         if not self._discovered_services:
             self._discovered_combo.addItem("No LAN servers found", "")
             self._discovered_combo.setEnabled(False)
         else:
             self._discovered_combo.setEnabled(True)
-            for service_id in sorted(self._discovered_services.keys()):
-                data = self._discovered_services[service_id]
-                self._discovered_combo.addItem(data["display"], service_id)
-            if current_id:
-                idx = self._discovered_combo.findData(current_id)
-                self._discovered_combo.setCurrentIndex(idx if idx >= 0 else 0)
-            else:
-                self._discovered_combo.setCurrentIndex(0)
+            for sid in sorted(self._discovered_services.keys()):
+                self._discovered_combo.addItem(
+                    self._discovered_services[sid]["display"], sid)
+            idx = self._discovered_combo.findData(current_id) if current_id else -1
+            self._discovered_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self._discovered_combo.blockSignals(False)
         if self._discovered_combo.isEnabled():
             self._on_discovered_selected(self._discovered_combo.currentIndex())
 
-    def _on_discovered_service(self, payload):
-        service_id = payload.get("id", "")
-        if not service_id:
+    def _on_discovered_service(self, payload: dict):
+        sid = payload.get("id", "")
+        if not sid:
             return
-        self._discovered_services[service_id] = payload
-        self._refresh_discovered_combo(selected_id=service_id)
+        self._discovered_services[sid] = payload
+        self._refresh_discovered_combo(selected_id=sid)
         self._discover_status.setText(
-            f"LAN discovery: {len(self._discovered_services)} server(s) found"
-        )
+            f"LAN discovery: {len(self._discovered_services)} server(s) found")
         current = self._srv.text().strip()
         if current in ("", "https://localhost:5000"):
             self._srv.setText(payload.get("url", current))
 
-    def _on_removed_service(self, service_id):
-        if service_id in self._discovered_services:
-            self._discovered_services.pop(service_id, None)
-            self._refresh_discovered_combo()
-        if self._discovered_services:
-            self._discover_status.setText(
-                f"LAN discovery: {len(self._discovered_services)} server(s) found"
-            )
-        else:
-            self._discover_status.setText("LAN discovery: no servers found")
+    def _on_removed_service(self, service_id: str):
+        self._discovered_services.pop(service_id, None)
+        self._refresh_discovered_combo()
+        count = len(self._discovered_services)
+        self._discover_status.setText(
+            f"LAN discovery: {count} server(s) found" if count
+            else "LAN discovery: no servers found")
 
-    def _on_discovered_selected(self, index):
+    def _on_discovered_selected(self, index: int):
         if index < 0:
             return
-        service_id = self._discovered_combo.itemData(index)
-        if not service_id:
+        sid = self._discovered_combo.itemData(index)
+        if not sid:
             return
-        data = self._discovered_services.get(service_id)
+        data = self._discovered_services.get(sid)
         if data and data.get("url"):
             self._srv.setText(data["url"])
 
     def _do_login(self):
+        # FIX: run network call off the GUI thread via LoginWorker
+        if self._login_worker and self._login_worker.isRunning():
+            return
+
         srv = self._srv.text().strip().rstrip("/")
         srv_lower = srv.lower()
+        # Force HTTPS
         if srv_lower.startswith("http://"):
             srv = f"https://{srv[7:]}"
             self._srv.setText(srv)
-        elif srv and not srv_lower.startswith(("http://", "https://")):
+        elif srv and not srv_lower.startswith("https://"):
             srv = f"https://{srv}"
             self._srv.setText(srv)
-        pw  = self._pw.text()
-        if not srv and self._discovered_services:
-            first = next(iter(self._discovered_services.values()))
-            srv = first.get("url", "")
-            self._srv.setText(srv)
+
+        pw = self._pw.text()
         if not srv or not pw:
-            self._err.setText("⚠  Fill in all fields"); return
-        self._btn.setText("CONNECTING…"); self._btn.setEnabled(False)
-        self._err.setText("")
+            self._err.setText("⚠  Fill in all fields")
+            return
+
         try:
-            r = _api_request("POST", f"{srv}/login", json={"password":pw}, timeout=5)
-            if r.status_code == 200:
-                self._stop_discovery()
-                self._settings.setValue("client/last_server", srv)
-                self.login_ok.emit(srv, r.json()["token"])
-            elif r.status_code == 403:
-                self._err.setText("✗  Invalid password")
-            else:
-                self._err.setText(f"✗  Login failed (HTTP {r.status_code})")
-        except Exception as e:
-            self._err.setText(f"✗  Cannot reach server ({e})")
-        finally:
-            self._btn.setText("CONNECT"); self._btn.setEnabled(True)
+            authority = _authority_key(srv)
+        except Exception:
+            self._err.setText("✗  Invalid server address")
+            return
+
+        discovered_fp = self._selected_discovery_fingerprint()
+        stored_fp     = _normalize_fingerprint(
+            self._server_fingerprints.get(authority, ""))
+
+        if discovered_fp and stored_fp and discovered_fp != stored_fp:
+            self._err.setText("✗  Server identity changed (fingerprint mismatch)")
+            return
+
+        pin_to_use      = stored_fp or discovered_fp
+        allow_untrusted = not bool(pin_to_use)
+
+        self._btn.setText("CONNECTING…")
+        self._btn.setEnabled(False)
+        self._err.setText("")
+
+        self._login_worker = LoginWorker(srv, pw, pin_to_use, allow_untrusted)
+        self._login_worker.success.connect(self._on_login_success)
+        self._login_worker.failure.connect(self._on_login_failure)
+        self._login_worker.finished.connect(self._on_login_finished)
+        self._login_worker.start()
+
+    def _on_login_success(self, srv: str, token: str, learned_fp: str):
+        self._stop_discovery()
+        self._settings.setValue("client/last_server", srv)
+        authority = _authority_key(srv)
+        if learned_fp:
+            self._server_fingerprints[authority] = learned_fp
+            self._save_pinned_fingerprints()
+        self.login_ok.emit(srv, token)
+
+    def _on_login_failure(self, msg: str):
+        self._err.setText(msg)
+
+    def _on_login_finished(self):
+        self._btn.setText("CONNECT")
+        self._btn.setEnabled(True)
+        self._login_worker = None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CLIENT DASHBOARD
@@ -1535,28 +1823,37 @@ class ClientLoginWidget(QWidget):
 class ClientDashWidget(QWidget):
     go_back = pyqtSignal()
 
-    def __init__(self, server, token):
+    def __init__(self, server: str, token: str):
         super().__init__()
-        self.server = server; self.token = token
-        self.files = []
-        self._all_files = []
-        self._workers = []
+        self.server         = server
+        self.token          = token
+        self.files          = []
+        self._all_files     = []
+        self._workers       = []
         self._fetch_inflight = False
+        self._last_preview  = None
         self._build_ui()
         self._sync_timer = QTimer()
         self._sync_timer.timeout.connect(self._refresh)
-        self._sync_timer.start(10000)
+        self._sync_timer.start(10_000)
         self._refresh()
 
     def _build_ui(self):
-        root = QVBoxLayout(self); root.setSpacing(0); root.setContentsMargins(0,0,0,0)
+        root = QVBoxLayout(self)
+        root.setSpacing(0)
+        root.setContentsMargins(0, 0, 0, 0)
 
         # Top bar
-        bar = QFrame(); bar.setFixedHeight(58)
-        bar.setStyleSheet(f"background:{C['panel']};border-bottom:1px solid {C['border']};")
-        bl = QHBoxLayout(bar); bl.setContentsMargins(20,0,20,0)
-        back = QPushButton("⏏  DISCONNECT"); back.setObjectName("btn_danger")
-        back.setFixedSize(130,32); back.clicked.connect(self._disconnect)
+        bar = QFrame()
+        bar.setFixedHeight(58)
+        bar.setStyleSheet(
+            f"background:{C['panel']};border-bottom:1px solid {C['border']};")
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(20, 0, 20, 0)
+        back = QPushButton("⏏  DISCONNECT")
+        back.setObjectName("btn_danger")
+        back.setFixedSize(130, 32)
+        back.clicked.connect(self._disconnect)
         bl.addWidget(back)
         bl.addSpacing(12)
         bl.addWidget(label(f"● {self.server}",
@@ -1573,17 +1870,20 @@ class ClientDashWidget(QWidget):
         bl.addWidget(self._sync_label)
         root.addWidget(bar)
 
-        # Main splitter — file list LEFT, preview RIGHT
+        # Main splitter
         splitter = QSplitter(Qt.Horizontal)
 
         # ── LEFT: file list ──
         left = QWidget()
-        ll = QVBoxLayout(left); ll.setSpacing(10); ll.setContentsMargins(14,14,14,14)
+        ll   = QVBoxLayout(left)
+        ll.setSpacing(10)
+        ll.setContentsMargins(14, 14, 14, 14)
 
-        # Action row
-        ar = QHBoxLayout(); ar.setSpacing(8)
+        ar = QHBoxLayout()
+        ar.setSpacing(8)
         self._upload_btn = QPushButton("↑ UPLOAD")
-        self._upload_btn.setObjectName("btn_accent"); self._upload_btn.setFixedHeight(36)
+        self._upload_btn.setObjectName("btn_accent")
+        self._upload_btn.setFixedHeight(36)
         self._upload_btn.clicked.connect(self._upload)
         self._dl_btn = QPushButton("↓ DOWNLOAD")
         self._dl_btn.setObjectName("btn_subtle")
@@ -1594,39 +1894,46 @@ class ClientDashWidget(QWidget):
         self._prev_btn.setFixedHeight(36)
         self._prev_btn.clicked.connect(self._preview)
         self._del_btn = QPushButton("✕ DELETE")
-        self._del_btn.setObjectName("btn_danger"); self._del_btn.setFixedHeight(36)
+        self._del_btn.setObjectName("btn_danger")
+        self._del_btn.setFixedHeight(36)
         self._del_btn.clicked.connect(self._delete)
-        ar.addWidget(self._upload_btn); ar.addWidget(self._dl_btn)
-        ar.addWidget(self._prev_btn); ar.addStretch()
+        ar.addWidget(self._upload_btn)
+        ar.addWidget(self._dl_btn)
+        ar.addWidget(self._prev_btn)
+        ar.addStretch()
         ar.addWidget(self._del_btn)
         ll.addLayout(ar)
 
         # Filter row
-        flt = QHBoxLayout(); flt.setSpacing(8)
+        flt = QHBoxLayout()
+        flt.setSpacing(8)
         self._filter_input = QLineEdit()
         self._filter_input.setPlaceholderText("Filter files by name…")
         self._filter_input.textChanged.connect(self._apply_filter)
-        self._clear_filter_btn = QPushButton("CLEAR")
-        self._clear_filter_btn.setObjectName("btn_subtle")
-        self._clear_filter_btn.setFixedSize(64, 30)
-        self._clear_filter_btn.clicked.connect(lambda: self._filter_input.clear())
+        clr_flt = QPushButton("CLEAR")
+        clr_flt.setObjectName("btn_subtle")
+        clr_flt.setFixedSize(64, 30)
+        clr_flt.clicked.connect(lambda: self._filter_input.clear())
         flt.addWidget(self._filter_input)
-        flt.addWidget(self._clear_filter_btn)
+        flt.addWidget(clr_flt)
         ll.addLayout(flt)
 
         # Progress
         self._prog_label = label("", f"font-size:11px;color:{C['muted']};")
         self._prog_label.hide()
-        self._prog_bar = QProgressBar(); self._prog_bar.setFixedHeight(6)
+        self._prog_bar = QProgressBar()
+        self._prog_bar.setFixedHeight(6)
         self._prog_bar.hide()
-        ll.addWidget(self._prog_label); ll.addWidget(self._prog_bar)
+        ll.addWidget(self._prog_label)
+        ll.addWidget(self._prog_bar)
 
-        # Table
+        # File table
         self._table = QTableWidget()
         self._table.setColumnCount(3)
-        self._table.setHorizontalHeaderLabels(["FILENAME","SIZE","MODIFIED"])
-        self._table.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch)
-        self._table.setColumnWidth(1,90); self._table.setColumnWidth(2,160)
+        self._table.setHorizontalHeaderLabels(["FILENAME", "SIZE", "MODIFIED"])
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._table.setColumnWidth(1, 90)
+        self._table.setColumnWidth(2, 160)
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1639,11 +1946,14 @@ class ClientDashWidget(QWidget):
         self._stats_label = label("0 files", f"font-size:11px;color:{C['muted']};")
         ll.addWidget(self._stats_label)
 
-        # ── RIGHT: inline preview panel ──
+        # ── RIGHT: preview panel ──
         right = QWidget()
         right.setMinimumWidth(200)
-        right.setStyleSheet(f"background:{C['panel']};border-left:1px solid {C['border']};")
-        rl = QVBoxLayout(right); rl.setSpacing(10); rl.setContentsMargins(14,14,14,14)
+        right.setStyleSheet(
+            f"background:{C['panel']};border-left:1px solid {C['border']};")
+        rl = QVBoxLayout(right)
+        rl.setSpacing(10)
+        rl.setContentsMargins(14, 14, 14, 14)
 
         ph = QHBoxLayout()
         ph.addWidget(label("PREVIEW PANEL",
@@ -1651,7 +1961,7 @@ class ClientDashWidget(QWidget):
         ph.addStretch()
         self._pop_btn = QPushButton("⤢")
         self._pop_btn.setObjectName("btn_icon")
-        self._pop_btn.setFixedSize(28,24)
+        self._pop_btn.setFixedSize(28, 24)
         self._pop_btn.setToolTip("Open in popup")
         self._pop_btn.clicked.connect(self._popup_preview)
         self._pop_btn.setEnabled(False)
@@ -1661,73 +1971,77 @@ class ClientDashWidget(QWidget):
 
         self._prev_stack = QStackedWidget()
 
-        # Placeholder
+        # 0 — placeholder
         placeholder = QWidget()
-        phl = QVBoxLayout(placeholder); phl.setAlignment(Qt.AlignCenter)
-        phl.addWidget(label("◈",f"font-size:36px;color:{C['dim']};"), alignment=Qt.AlignCenter)
+        phl = QVBoxLayout(placeholder)
+        phl.setAlignment(Qt.AlignCenter)
+        phl.addWidget(label("◈", f"font-size:36px;color:{C['dim']};"),
+            alignment=Qt.AlignCenter)
         phl.addWidget(label("Select a file and click\nPREVIEW to inspect it",
-            f"font-size:11px;color:{C['dim']};text-align:center;"), alignment=Qt.AlignCenter)
+            f"font-size:11px;color:{C['dim']};text-align:center;"),
+            alignment=Qt.AlignCenter)
 
-        # Image viewer
+        # 1 — image viewer
         self._img_scroll = QScrollArea()
         self._img_scroll.setWidgetResizable(True)
         self._img_scroll.setStyleSheet("background:transparent;border:none;")
-        self._img_label = QLabel(); self._img_label.setAlignment(Qt.AlignCenter)
+        self._img_label  = QLabel()
+        self._img_label.setAlignment(Qt.AlignCenter)
         self._img_scroll.setWidget(self._img_label)
 
-        # Text viewer
+        # 2 — text viewer
         self._txt_view = QTextEdit()
         self._txt_view.setReadOnly(True)
-        self._txt_view.setFont(QFont("Consolas",11))
+        self._txt_view.setFont(QFont("Consolas", 11))
 
-        # Unsupported
+        # 3 — unsupported / error
         self._unsup = QLabel()
         self._unsup.setAlignment(Qt.AlignCenter)
         self._unsup.setStyleSheet(f"font-size:12px;color:{C['muted']};")
+        self._unsup.setWordWrap(True)
 
-        # Loading
+        # 4 — loading
         self._loading = QLabel("Loading preview…")
         self._loading.setAlignment(Qt.AlignCenter)
         self._loading.setStyleSheet(f"font-size:12px;color:{C['muted']};")
 
-        self._prev_stack.addWidget(placeholder)      # 0
-        self._prev_stack.addWidget(self._img_scroll) # 1
-        self._prev_stack.addWidget(self._txt_view)   # 2
-        self._prev_stack.addWidget(self._unsup)      # 3
-        self._prev_stack.addWidget(self._loading)    # 4
-
+        self._prev_stack.addWidget(placeholder)       # 0
+        self._prev_stack.addWidget(self._img_scroll)  # 1
+        self._prev_stack.addWidget(self._txt_view)    # 2
+        self._prev_stack.addWidget(self._unsup)       # 3
+        self._prev_stack.addWidget(self._loading)     # 4
         rl.addWidget(self._prev_stack)
 
-        # File name in preview
-        self._prev_filename = label("",f"font-size:10px;color:{C['muted']};")
+        self._prev_filename = label("", f"font-size:10px;color:{C['muted']};")
         rl.addWidget(self._prev_filename)
 
-        splitter.addWidget(left); splitter.addWidget(right)
-        splitter.setSizes([580,340])
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([580, 340])
         root.addWidget(splitter)
 
-        # Store last preview data for popup
-        self._last_preview = None  # (filename, data, mime)
         self._set_action_state(False)
 
-    # ── Actions ──
-    def _track_worker(self, worker):
-        self._workers.append(worker)
-        worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
+    # ── Worker tracking ──
+    def _track_worker(self, w: QThread):
+        self._workers.append(w)
+        w.finished.connect(lambda worker=w: self._on_worker_finished(worker))
 
-    def _on_worker_finished(self, worker):
-        if worker in self._workers:
-            self._workers.remove(worker)
-        worker.deleteLater()
+    def _on_worker_finished(self, w: QThread):
+        if w in self._workers:
+            self._workers.remove(w)
+        w.deleteLater()
 
-    def _set_action_state(self, has_selection):
-        self._dl_btn.setEnabled(has_selection)
-        self._prev_btn.setEnabled(has_selection)
-        self._del_btn.setEnabled(has_selection)
+    # ── Selection state ──
+    def _set_action_state(self, has_sel: bool):
+        self._dl_btn.setEnabled(has_sel)
+        self._prev_btn.setEnabled(has_sel)
+        self._del_btn.setEnabled(has_sel)
 
     def _on_selection_changed(self):
         self._set_action_state(self._sel_file() is not None)
 
+    # ── Refresh ──
     def _refresh(self):
         if self._fetch_inflight:
             return
@@ -1745,10 +2059,10 @@ class ClientDashWidget(QWidget):
         self._fetch_inflight = False
         self._refresh_btn.setEnabled(True)
 
-    def _on_refresh_error(self, err):
+    def _on_refresh_error(self, err: str):
         self._sync_label.setText(f"✗ {err}")
 
-    def _populate(self, files):
+    def _populate(self, files: list):
         selected_name = self._sel_file()
         self._all_files = sorted(files, key=lambda f: f["modified"], reverse=True)
         self._apply_filter(selected_name=selected_name)
@@ -1756,10 +2070,8 @@ class ClientDashWidget(QWidget):
 
     def _apply_filter(self, _text=None, selected_name=None):
         query = self._filter_input.text().strip().lower()
-        if query:
-            self.files = [f for f in self._all_files if query in f["name"].lower()]
-        else:
-            self.files = list(self._all_files)
+        self.files = ([f for f in self._all_files if query in f["name"].lower()]
+                      if query else list(self._all_files))
         self._render_table(selected_name=selected_name)
 
     def _render_table(self, selected_name=None):
@@ -1770,167 +2082,197 @@ class ClientDashWidget(QWidget):
             ni = QTableWidgetItem(f["name"])
             ni.setForeground(QColor(C["text"]))
             ni.setData(Qt.UserRole, f["name"])
-
             si = QTableWidgetItem(fmt_size(f["size"]))
             si.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             si.setForeground(QColor(C["muted"]))
-
             mi = QTableWidgetItem(fmt_time(f["modified"]))
             mi.setTextAlignment(Qt.AlignCenter)
             mi.setForeground(QColor(C["muted"]))
-
             t.setItem(i, 0, ni)
             t.setItem(i, 1, si)
             t.setItem(i, 2, mi)
             t.setRowHeight(i, 38)
             if selected_name and f["name"] == selected_name:
                 selected_row = i
-
         if selected_row >= 0:
             t.selectRow(selected_row)
         else:
             t.clearSelection()
-
         shown = len(self.files)
-        total_files = len(self._all_files)
+        total = len(self._all_files)
         total_size = sum(f["size"] for f in self._all_files)
-        if shown == total_files:
-            self._stats_label.setText(
-                f"{total_files} file{'s' if total_files != 1 else ''}  ·  {fmt_size(total_size)}"
-            )
-        else:
-            self._stats_label.setText(
-                f"{shown}/{total_files} shown  ·  {fmt_size(total_size)} total"
-            )
+        self._stats_label.setText(
+            f"{shown}/{total} shown  ·  {fmt_size(total_size)} total"
+            if shown != total
+            else f"{total} file{'s' if total != 1 else ''}  ·  {fmt_size(total_size)}")
         self._on_selection_changed()
 
-    def _sel_file(self):
-        row = self._table.currentRow()
-        if row < 0:
-            return None
-        item = self._table.item(row, 0)
-        if not item:
-            return None
-        return item.data(Qt.UserRole)
+    def _sel_file(self) -> Optional[str]:
+        row  = self._table.currentRow()
+        item = self._table.item(row, 0) if row >= 0 else None
+        return item.data(Qt.UserRole) if item else None
 
+    # ── Upload ──
     def _upload(self):
-        paths,_ = QFileDialog.getOpenFileNames(self,"Select Files to Upload")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select Files to Upload")
         for p in paths:
             self._do_upload(p)
 
-    def _do_upload(self, path):
+    def _do_upload(self, path: str):
         self._prog_label.setText(f"Uploading: {os.path.basename(path)}")
-        self._prog_label.show(); self._prog_bar.setValue(0); self._prog_bar.show()
+        self._prog_label.show()
+        self._prog_bar.setValue(0)
+        self._prog_bar.show()
         w = UploadWorker(self.server, self.token, path)
         w.progress.connect(self._prog_bar.setValue)
-        w.done.connect(lambda ok,m: self._upload_done(ok,m))
+        w.done.connect(self._upload_done)
         self._track_worker(w)
         w.start()
 
-    def _upload_done(self, ok, msg):
+    def _upload_done(self, ok: bool, msg: str):
         self._prog_bar.setValue(100)
-        self._prog_label.setText(f"{'✓ Uploaded' if ok else '✗ Upload failed'}: {msg}")
+        self._prog_label.setText(
+            f"{'✓ Uploaded' if ok else '✗ Upload failed'}: {msg}")
         QTimer.singleShot(2500, self._hide_prog)
         if ok:
             self._refresh()
 
+    # ── Download ──
     def _download(self):
         name = self._sel_file()
         if not name:
             self._stats_label.setText("Select a file to download")
             return
-        save,_ = QFileDialog.getSaveFileName(self,"Save As", os.path.basename(name))
-        if not save: return
+        save, _ = QFileDialog.getSaveFileName(self, "Save As",
+                                              os.path.basename(name))
+        if not save:
+            return
         self._prog_label.setText(f"Downloading: {os.path.basename(name)}")
-        self._prog_label.show(); self._prog_bar.setValue(0); self._prog_bar.show()
+        self._prog_label.show()
+        self._prog_bar.setValue(0)
+        self._prog_bar.show()
         w = DownloadWorker(self.server, self.token, name, save)
         w.progress.connect(self._prog_bar.setValue)
-        w.done.connect(lambda ok,m: self._dl_done(ok,m))
+        w.done.connect(self._dl_done)
         self._track_worker(w)
         w.start()
 
-    def _dl_done(self, ok, msg):
-        self._prog_bar.setValue(100)
-        self._prog_label.setText(f"{'✓ Saved' if ok else '✗ Failed'}: {msg}")
+    def _dl_done(self, ok: bool, msg: str):
+        self._prog_bar.setValue(100 if ok else 0)
+        self._prog_label.setText(
+            f"{'✓ Saved to' if ok else '✗ Failed'}: {msg}")
         QTimer.singleShot(3000, self._hide_prog)
 
+    # ── Preview ──
     def _preview(self):
         name = self._sel_file()
         if not name:
             self._stats_label.setText("Select a file to preview")
             return
-        self._prev_stack.setCurrentIndex(4)  # loading
+        self._prev_stack.setCurrentIndex(4)
         self._prev_filename.setText(f"Loading {os.path.basename(name)}…")
         w = PreviewWorker(self.server, self.token, name)
-        w.done.connect(lambda data,mime: self._show_inline(name, data, mime))
-        w.error.connect(lambda e: self._show_error(e))
+        w.done.connect(lambda data, mime: self._show_inline(name, data, mime))
+        w.error.connect(self._show_error)
         self._track_worker(w)
         w.start()
 
-    def _show_inline(self, name, data, mime):
+    def _show_inline(self, name: str, data: bytes, mime: str):
         self._last_preview = (name, data, mime)
         self._pop_btn.setEnabled(True)
         fname = os.path.basename(name)
         self._prev_filename.setText(f"{fname}  ·  {fmt_size(len(data))}")
+
         is_img  = mime.startswith("image/")
         is_text = mime.startswith("text/") or mime in (
-            "application/json","application/xml","application/javascript")
+            "application/json", "application/xml", "application/javascript",
+        )
+
         if is_img:
-            px = QPixmap(); px.loadFromData(QByteArray(data))
-            avail = self._img_scroll.width() - 20
+            px = QPixmap()
+            px.loadFromData(QByteArray(data))
+            avail = max(self._img_scroll.width() - 20, 100)
             if px.width() > avail:
                 px = px.scaledToWidth(avail, Qt.SmoothTransformation)
             self._img_label.setPixmap(px)
             self._prev_stack.setCurrentIndex(1)
         elif is_text:
-            try: txt = data.decode("utf-8")
-            except: txt = data.decode("latin-1","replace")
+            try:
+                txt = data.decode("utf-8")
+            except UnicodeDecodeError:
+                txt = data.decode("latin-1", errors="replace")
             self._txt_view.setPlainText(txt)
             self._prev_stack.setCurrentIndex(2)
         else:
-            self._unsup.setText(f"⚠  Cannot preview\n{mime}\nSize: {fmt_size(len(data))}")
+            self._unsup.setText(
+                f"⚠  Cannot preview this file type.\n\n"
+                f"Type: {mime}\nSize: {fmt_size(len(data))}\n\n"
+                f"Download the file to open it locally.")
             self._prev_stack.setCurrentIndex(3)
 
-    def _show_error(self, msg):
+    def _show_error(self, msg: str):
         self._last_preview = None
         self._pop_btn.setEnabled(False)
-        self._unsup.setText(f"✗ Preview error:\n{msg}")
+        self._unsup.setText(f"✗  Preview error:\n{msg}")
         self._prev_stack.setCurrentIndex(3)
 
     def _popup_preview(self):
-        if not self._last_preview: return
+        if not self._last_preview:
+            return
         dlg = PreviewDialog(*self._last_preview, parent=self)
         dlg.exec_()
 
+    # ── Delete ──
     def _delete(self):
         name = self._sel_file()
         if not name:
-            self._stats_label.setText("Select a file to delete")
             return
-        r = QMessageBox.question(self,"Confirm",f"Delete '{name}' from server?",
-            QMessageBox.Yes|QMessageBox.No)
-        if r != QMessageBox.Yes: return
+        r = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Delete '{name}' from server?\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if r != QMessageBox.Yes:
+            return
         try:
-            resp = _api_request("DELETE", f"{self.server}/delete/{name}",
-                headers={"X-Auth-Token":self.token}, timeout=5)
+            resp = _api_request(
+                "DELETE",
+                f"{self.server}/delete/{name}",
+                headers={"X-Auth-Token": self.token},
+                timeout=5,
+            )
             if resp.ok:
                 self._refresh()
+                # Clear preview if the deleted file was being previewed
+                if self._last_preview and self._last_preview[0] == name:
+                    self._last_preview = None
+                    self._pop_btn.setEnabled(False)
+                    self._prev_stack.setCurrentIndex(0)
+                    self._prev_filename.setText("")
             else:
                 self._stats_label.setText(f"✗ Delete failed (HTTP {resp.status_code})")
         except Exception as e:
             self._stats_label.setText(f"✗ {e}")
 
     def _hide_prog(self):
-        self._prog_bar.hide(); self._prog_label.hide()
+        self._prog_bar.hide()
+        self._prog_label.hide()
 
     def _disconnect(self):
         self._sync_timer.stop()
         self._last_preview = None
         self._pop_btn.setEnabled(False)
-        try: _api_request("POST", f"{self.server}/logout",
-            headers={"X-Auth-Token":self.token}, timeout=3)
-        except: pass
+        try:
+            _api_request(
+                "POST",
+                f"{self.server}/logout",
+                headers={"X-Auth-Token": self.token},
+                timeout=3,
+            )
+        except Exception:
+            pass
         self.go_back.emit()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN WINDOW
@@ -1942,17 +2284,15 @@ class MainWindow(QMainWindow):
         self.resize(1060, 700)
         self.setMinimumSize(800, 560)
 
-        self._stack = QStackedWidget()
-        self.setCentralWidget(self._stack)
-
+        self._stack      = QStackedWidget()
         self._launcher   = LauncherWidget()
         self._srv_widget = ServerWidget()
         self._cli_login  = ClientLoginWidget()
-        # dashboard created on login
 
         self._stack.addWidget(self._launcher)    # 0
         self._stack.addWidget(self._srv_widget)  # 1
         self._stack.addWidget(self._cli_login)   # 2
+        self.setCentralWidget(self._stack)
 
         self._launcher.chose_server.connect(lambda: self._stack.setCurrentIndex(1))
         self._launcher.chose_client.connect(lambda: self._stack.setCurrentIndex(2))
@@ -1960,11 +2300,13 @@ class MainWindow(QMainWindow):
         self._cli_login.go_back.connect(lambda: self._stack.setCurrentIndex(0))
         self._cli_login.login_ok.connect(self._on_login)
 
-        self.statusBar().setStyleSheet(
-            f"background:{C['panel']};color:{C['muted']};border-top:1px solid {C['border']};")
-        self.statusBar().showMessage("  Welcome to Droplink v2")
+        sb = self.statusBar()
+        sb.setStyleSheet(
+            f"background:{C['panel']};color:{C['muted']};"
+            f"border-top:1px solid {C['border']};")
+        sb.showMessage("  Welcome to Droplink v2")
 
-    def _on_login(self, server, token):
+    def _on_login(self, server: str, token: str):
         dash = ClientDashWidget(server, token)
         dash.go_back.connect(self._on_client_back)
         self._stack.addWidget(dash)
@@ -1972,7 +2314,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"  Connected to {server}")
 
     def _on_client_back(self):
-        # Remove dashboard widget
         w = self._stack.currentWidget()
         self._stack.setCurrentIndex(2)
         self._stack.removeWidget(w)
@@ -1985,6 +2326,7 @@ class MainWindow(QMainWindow):
             if self._srv_widget._server_thread:
                 self._srv_widget._server_thread.wait(2000)
         super().closeEvent(event)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
