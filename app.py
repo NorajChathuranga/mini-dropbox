@@ -13,6 +13,7 @@ from functools import wraps
 # ── Flask (server side) ────────────────────────────────────────────────────────
 from flask import Flask, request, jsonify, send_file, abort
 from werkzeug.utils import secure_filename
+from werkzeug.serving import make_server
 
 # ── Qt ─────────────────────────────────────────────────────────────────────────
 from PyQt5.QtWidgets import (
@@ -23,10 +24,10 @@ from PyQt5.QtWidgets import (
     QScrollArea, QSizePolicy, QSpacerItem, QDialog, QDialogButtonBox
 )
 from PyQt5.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QSize, QByteArray
+    Qt, QThread, pyqtSignal, QTimer, QSize, QByteArray, QSettings
 )
 from PyQt5.QtGui import (
-    QFont, QColor, QPalette, QPixmap, QImage, QTextCursor
+    QFont, QColor, QPalette, QPixmap, QImage, QTextCursor, QIntValidator
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -354,14 +355,31 @@ def _delete(fp):
     return jsonify({"status":"ok"})
 
 class FlaskThread(QThread):
+    started_ok = pyqtSignal()
+    failed = pyqtSignal(str)
+
     def __init__(self, port=5000):
         super().__init__()
         self.port = port
+        self._http_server = None
+
     def run(self):
         import logging
         log = logging.getLogger("werkzeug")
         log.setLevel(logging.ERROR)
-        _flask_app.run(host="0.0.0.0", port=self.port, debug=False, use_reloader=False)
+
+        try:
+            self._http_server = make_server("0.0.0.0", self.port, _flask_app, threaded=True)
+            self.started_ok.emit()
+            self._http_server.serve_forever()
+        except Exception as e:
+            self.failed.emit(str(e))
+        finally:
+            self._http_server = None
+
+    def stop(self):
+        if self._http_server is not None:
+            self._http_server.shutdown()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  WORKER THREADS (client side)
@@ -378,20 +396,31 @@ class UploadWorker(QThread):
             size = os.path.getsize(self.path)
             name = os.path.basename(self.path)
             uploaded = [0]
-            orig = open(self.path,"rb")
             this = self
-            class Wrapped:
-                def read(self_, n=-1):
-                    chunk = orig.read(n)
-                    uploaded[0] += len(chunk)
-                    if size: this.progress.emit(int(uploaded[0]/size*100))
-                    return chunk
-                def __getattr__(self_, k): return getattr(orig, k)
-            r = _req.post(f"{self.srv}/upload",
-                headers={"X-Auth-Token":self.tok},
-                files={"file":(name,Wrapped())}, timeout=120)
-            orig.close()
-            self.done.emit(r.status_code==200, name)
+
+            with open(self.path, "rb") as orig:
+                class Wrapped:
+                    def read(self_, n=-1):
+                        chunk = orig.read(n)
+                        uploaded[0] += len(chunk)
+                        if size:
+                            this.progress.emit(int(uploaded[0] / size * 100))
+                        return chunk
+
+                    def __getattr__(self_, k):
+                        return getattr(orig, k)
+
+                r = _req.post(
+                    f"{self.srv}/upload",
+                    headers={"X-Auth-Token": self.tok},
+                    files={"file": (name, Wrapped())},
+                    timeout=120,
+                )
+
+            if r.ok:
+                self.done.emit(True, name)
+            else:
+                self.done.emit(False, f"{name} (HTTP {r.status_code})")
         except Exception as e: self.done.emit(False, str(e))
 
 class DownloadWorker(QThread):
@@ -403,6 +432,9 @@ class DownloadWorker(QThread):
         try:
             r = _req.get(f"{self.srv}/download/{self.rp}",
                 headers={"X-Auth-Token":self.tok}, stream=True, timeout=120)
+            if not r.ok:
+                self.done.emit(False, f"HTTP {r.status_code}")
+                return
             total = int(r.headers.get("content-length",0))
             done = 0
             with open(self.sp,"wb") as f:
@@ -422,6 +454,9 @@ class PreviewWorker(QThread):
         try:
             r = _req.get(f"{self.srv}/preview/{self.rp}",
                 headers={"X-Auth-Token":self.tok}, timeout=30)
+            if not r.ok:
+                self.error.emit(f"HTTP {r.status_code}")
+                return
             mime = r.headers.get("content-type","").split(";")[0]
             self.done.emit(r.content, mime)
         except Exception as e: self.error.emit(str(e))
@@ -435,7 +470,10 @@ class FileFetchWorker(QThread):
         try:
             r = _req.get(f"{self.srv}/files",
                 headers={"X-Auth-Token":self.tok}, timeout=8)
-            self.result.emit(r.json().get("files",[]) if r.ok else [])
+            if not r.ok:
+                self.error.emit(f"HTTP {r.status_code}")
+                return
+            self.result.emit(r.json().get("files",[]))
         except Exception as e: self.error.emit(str(e))
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -541,6 +579,7 @@ class ServerWidget(QWidget):
         super().__init__()
         self._flask_thread = None
         self._running = False
+        self._folder_btn = None
         self._workers = []
         self._build_ui()
 
@@ -579,6 +618,8 @@ class ServerWidget(QWidget):
         # Port
         ll.addWidget(label("Port", f"font-size:11px;color:{C['muted']};"))
         self._port_input = QLineEdit("5000")
+        self._port_input.setValidator(QIntValidator(1, 65535, self))
+        self._port_input.setPlaceholderText("1 - 65535")
         ll.addWidget(self._port_input)
 
         # Password
@@ -598,9 +639,9 @@ class ServerWidget(QWidget):
         fol_row = QHBoxLayout(); fol_row.setSpacing(6)
         self._folder_input = QLineEdit(str(SYNC_FOLDER.resolve()))
         self._folder_input.setReadOnly(True)
-        fol_btn = QPushButton("…"); fol_btn.setFixedSize(36,36)
-        fol_btn.clicked.connect(self._pick_folder)
-        fol_row.addWidget(self._folder_input); fol_row.addWidget(fol_btn)
+        self._folder_btn = QPushButton("…"); self._folder_btn.setFixedSize(36,36)
+        self._folder_btn.clicked.connect(self._pick_folder)
+        fol_row.addWidget(self._folder_input); fol_row.addWidget(self._folder_btn)
         ll.addLayout(fol_row)
 
         ll.addWidget(hline())
@@ -700,35 +741,92 @@ class ServerWidget(QWidget):
             SYNC_FOLDER.mkdir(exist_ok=True)
             self._folder_input.setText(d)
 
+    def _set_status(self, text, color):
+        self._status_dot.setText(text)
+        self._status_dot.setStyleSheet(f"font-size:11px;color:{color};letter-spacing:1px;")
+
+    def _set_server_controls(self, enabled):
+        self._port_input.setEnabled(enabled)
+        self._pw_input.setEnabled(enabled)
+        self._show_pw.setEnabled(enabled)
+        if self._folder_btn:
+            self._folder_btn.setEnabled(enabled)
+
     def _start_server(self):
+        if self._running:
+            return
+
         pw = self._pw_input.text().strip()
-        if not pw: QMessageBox.warning(self,"Error","Password cannot be empty."); return
-        port = int(self._port_input.text().strip() or "5000")
+        if not pw:
+            QMessageBox.warning(self, "Error", "Password cannot be empty.")
+            return
+
+        port_text = self._port_input.text().strip()
+        if not port_text:
+            QMessageBox.warning(self, "Error", "Enter a valid port (1-65535).")
+            return
+
+        try:
+            port = int(port_text)
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Port must be a number.")
+            return
+
+        if not 1 <= port <= 65535:
+            QMessageBox.warning(self, "Error", "Port must be between 1 and 65535.")
+            return
+
         _server_state["password"] = pw
+        _server_state["tokens"].clear()
+        _server_state["clients"].clear()
         _server_state["log_cb"] = self._append_log
+
         self._flask_thread = FlaskThread(port)
+        self._flask_thread.started_ok.connect(lambda p=port: self._on_server_started(p))
+        self._flask_thread.failed.connect(self._on_server_failed)
+        self._flask_thread.finished.connect(self._on_server_stopped)
+
+        self._set_server_controls(False)
+        self._start_btn.setEnabled(False)
+        self._set_status("● STARTING…", C["warn"])
+        self._append_log(f"⏳  Starting server on port {port}...")
         self._flask_thread.start()
+
+    def _on_server_started(self, port):
         self._running = True
         ip = get_local_ip()
         self._info_local.setText(f"Local:  http://localhost:{port}")
         self._info_net.setText(f"Network:  http://{ip}:{port}")
-        self._status_dot.setText("● ONLINE")
-        self._status_dot.setStyleSheet(f"font-size:11px;color:{C['success']};letter-spacing:1px;")
-        self._start_btn.hide(); self._stop_btn.show()
-        self._port_input.setEnabled(False)
-        self._pw_input.setEnabled(False)
+        self._set_status("● ONLINE", C["success"])
+        self._start_btn.hide()
+        self._stop_btn.setEnabled(True)
+        self._stop_btn.show()
         self._append_log(f"🚀  Server started on port {port}")
         self._append_log(f"📁  Sync folder: {SYNC_FOLDER.resolve()}")
         self._refresh_server_files()
 
-    def _stop_server(self):
-        # Flask dev server can't be gracefully stopped from a thread easily.
-        # We hide stop and warn the user — full stop requires process restart.
-        self._append_log("⚠  To fully stop the server, restart the application.")
-        self._stop_btn.hide(); self._start_btn.show()
+    def _on_server_failed(self, err):
+        self._append_log(f"✗  Server failed to start: {err}")
+        QMessageBox.critical(self, "Server Error", f"Could not start server:\n{err}")
+
+    def _on_server_stopped(self):
         self._running = False
-        self._status_dot.setText("● STOPPING…")
-        self._status_dot.setStyleSheet(f"font-size:11px;color:{C['warn']};letter-spacing:1px;")
+        self._set_status("● OFFLINE", C["danger"])
+        self._set_server_controls(True)
+        self._start_btn.setEnabled(True)
+        self._start_btn.show()
+        self._stop_btn.hide()
+        self._info_clients.setText("Clients:  0")
+        self._flask_thread = None
+
+    def _stop_server(self):
+        if not self._flask_thread:
+            self._on_server_stopped()
+            return
+        self._stop_btn.setEnabled(False)
+        self._set_status("● STOPPING…", C["warn"])
+        self._append_log("⏹  Stopping server...")
+        self._flask_thread.stop()
 
     def _append_log(self, msg):
         self._log_box.append(
@@ -736,7 +834,8 @@ class ServerWidget(QWidget):
         self._log_box.moveCursor(QTextCursor.End)
 
     def _update_stats(self):
-        if not self._running: return
+        if not self._running:
+            return
         active = sum(1 for t in _server_state["clients"].values()
                      if time.time()-t < 30)
         self._info_clients.setText(f"Clients:  {active} active")
@@ -744,10 +843,14 @@ class ServerWidget(QWidget):
         self._info_files.setText(f"Files:  {cnt}")
 
     def _refresh_server_files(self):
-        files = [{"name": str(p.relative_to(SYNC_FOLDER)),
-                  "size": p.stat().st_size,
-                  "modified": p.stat().st_mtime}
-                 for p in SYNC_FOLDER.rglob("*") if p.is_file()]
+        files = sorted(
+            [{"name": str(p.relative_to(SYNC_FOLDER)),
+              "size": p.stat().st_size,
+              "modified": p.stat().st_mtime}
+             for p in SYNC_FOLDER.rglob("*") if p.is_file()],
+            key=lambda f: f["modified"],
+            reverse=True,
+        )
         t = self._srv_file_table
         t.setRowCount(len(files))
         for i,f in enumerate(files):
@@ -762,10 +865,15 @@ class ServerWidget(QWidget):
 
     def _confirm_back(self):
         if self._running:
-            r = QMessageBox.question(self,"Go Back",
-                "Server is running. Go back to launcher?\n(Server will keep running in background)",
-                QMessageBox.Yes|QMessageBox.No)
-            if r != QMessageBox.Yes: return
+            r = QMessageBox.question(
+                self,
+                "Go Back",
+                "Server is running. Stop server and return to launcher?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if r != QMessageBox.Yes:
+                return
+            self._stop_server()
         self.go_back.emit()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -844,6 +952,7 @@ class ClientLoginWidget(QWidget):
 
     def __init__(self):
         super().__init__()
+        self._settings = QSettings("Droplink", "DroplinkApp")
         root = QVBoxLayout(self)
         root.setSpacing(0); root.setContentsMargins(0,0,0,0)
 
@@ -881,7 +990,8 @@ class ClientLoginWidget(QWidget):
         cl.addWidget(hline())
 
         cl.addWidget(label("SERVER ADDRESS", f"font-size:10px;color:{C['muted']};letter-spacing:2px;"))
-        self._srv = QLineEdit("http://localhost:5000")
+        last_server = self._settings.value("client/last_server", "http://localhost:5000")
+        self._srv = QLineEdit(str(last_server))
         self._srv.setPlaceholderText("http://192.168.x.x:5000")
         cl.addWidget(self._srv)
 
@@ -906,7 +1016,10 @@ class ClientLoginWidget(QWidget):
         root.addLayout(center)
 
     def _do_login(self):
-        srv = self._srv.text().rstrip("/")
+        srv = self._srv.text().strip().rstrip("/")
+        if srv and not srv.startswith(("http://", "https://")):
+            srv = f"http://{srv}"
+            self._srv.setText(srv)
         pw  = self._pw.text()
         if not srv or not pw:
             self._err.setText("⚠  Fill in all fields"); return
@@ -915,11 +1028,14 @@ class ClientLoginWidget(QWidget):
         try:
             r = _req.post(f"{srv}/login", json={"password":pw}, timeout=5)
             if r.status_code == 200:
+                self._settings.setValue("client/last_server", srv)
                 self.login_ok.emit(srv, r.json()["token"])
-            else:
+            elif r.status_code == 403:
                 self._err.setText("✗  Invalid password")
-        except:
-            self._err.setText("✗  Cannot reach server")
+            else:
+                self._err.setText(f"✗  Login failed (HTTP {r.status_code})")
+        except Exception as e:
+            self._err.setText(f"✗  Cannot reach server ({e})")
         finally:
             self._btn.setText("CONNECT"); self._btn.setEnabled(True)
 
@@ -932,7 +1048,10 @@ class ClientDashWidget(QWidget):
     def __init__(self, server, token):
         super().__init__()
         self.server = server; self.token = token
-        self.files = []; self._workers = []
+        self.files = []
+        self._all_files = []
+        self._workers = []
+        self._fetch_inflight = False
         self._build_ui()
         self._sync_timer = QTimer()
         self._sync_timer.timeout.connect(self._refresh)
@@ -953,6 +1072,12 @@ class ClientDashWidget(QWidget):
         bl.addWidget(label(f"● {self.server}",
             f"font-size:11px;color:{C['success']};letter-spacing:1px;"))
         bl.addStretch()
+        self._refresh_btn = QPushButton("⟳")
+        self._refresh_btn.setFixedSize(32, 28)
+        self._refresh_btn.setToolTip("Refresh now")
+        self._refresh_btn.clicked.connect(self._refresh)
+        bl.addWidget(self._refresh_btn)
+        bl.addSpacing(8)
         self._sync_label = label("Syncing…", f"font-size:11px;color:{C['muted']};")
         bl.addWidget(self._sync_label)
         root.addWidget(bar)
@@ -981,6 +1106,18 @@ class ClientDashWidget(QWidget):
         ar.addWidget(self._del_btn)
         ll.addLayout(ar)
 
+        # Filter row
+        flt = QHBoxLayout(); flt.setSpacing(8)
+        self._filter_input = QLineEdit()
+        self._filter_input.setPlaceholderText("Filter files by name…")
+        self._filter_input.textChanged.connect(self._apply_filter)
+        self._clear_filter_btn = QPushButton("CLEAR")
+        self._clear_filter_btn.setFixedSize(64, 30)
+        self._clear_filter_btn.clicked.connect(lambda: self._filter_input.clear())
+        flt.addWidget(self._filter_input)
+        flt.addWidget(self._clear_filter_btn)
+        ll.addLayout(flt)
+
         # Progress
         self._prog_label = label("", f"font-size:11px;color:{C['muted']};")
         self._prog_label.hide()
@@ -997,6 +1134,8 @@ class ClientDashWidget(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.itemSelectionChanged.connect(self._on_selection_changed)
         self._table.doubleClicked.connect(self._preview)
         ll.addWidget(self._table)
 
@@ -1016,6 +1155,7 @@ class ClientDashWidget(QWidget):
         self._pop_btn = QPushButton("⤢"); self._pop_btn.setFixedSize(28,24)
         self._pop_btn.setToolTip("Open in popup")
         self._pop_btn.clicked.connect(self._popup_preview)
+        self._pop_btn.setEnabled(False)
         ph.addWidget(self._pop_btn)
         rl.addLayout(ph)
         rl.addWidget(hline())
@@ -1069,37 +1209,115 @@ class ClientDashWidget(QWidget):
 
         # Store last preview data for popup
         self._last_preview = None  # (filename, data, mime)
+        self._set_action_state(False)
 
     # ── Actions ──
+    def _track_worker(self, worker):
+        self._workers.append(worker)
+        worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
+
+    def _on_worker_finished(self, worker):
+        if worker in self._workers:
+            self._workers.remove(worker)
+        worker.deleteLater()
+
+    def _set_action_state(self, has_selection):
+        self._dl_btn.setEnabled(has_selection)
+        self._prev_btn.setEnabled(has_selection)
+        self._del_btn.setEnabled(has_selection)
+
+    def _on_selection_changed(self):
+        self._set_action_state(self._sel_file() is not None)
+
     def _refresh(self):
+        if self._fetch_inflight:
+            return
+        self._fetch_inflight = True
+        self._refresh_btn.setEnabled(False)
         self._sync_label.setText("⟳ Syncing…")
         w = FileFetchWorker(self.server, self.token)
         w.result.connect(self._populate)
-        w.error.connect(lambda e: self._sync_label.setText(f"✗ {e}"))
-        w.start(); self._workers.append(w)
+        w.error.connect(self._on_refresh_error)
+        w.finished.connect(self._on_refresh_finished)
+        self._track_worker(w)
+        w.start()
+
+    def _on_refresh_finished(self):
+        self._fetch_inflight = False
+        self._refresh_btn.setEnabled(True)
+
+    def _on_refresh_error(self, err):
+        self._sync_label.setText(f"✗ {err}")
 
     def _populate(self, files):
-        self.files = files
-        self._table.setRowCount(len(files))
-        for i,f in enumerate(files):
-            ni = QTableWidgetItem(f["name"]); ni.setForeground(QColor(C["text"]))
-            si = QTableWidgetItem(fmt_size(f["size"]))
-            si.setTextAlignment(Qt.AlignRight|Qt.AlignVCenter); si.setForeground(QColor(C["muted"]))
-            mi = QTableWidgetItem(fmt_time(f["modified"]))
-            mi.setTextAlignment(Qt.AlignCenter); mi.setForeground(QColor(C["muted"]))
-            self._table.setItem(i,0,ni); self._table.setItem(i,1,si); self._table.setItem(i,2,mi)
-            self._table.setRowHeight(i,38)
-        total = sum(f["size"] for f in files)
-        self._stats_label.setText(f"{len(files)} file{'s' if len(files)!=1 else ''}  ·  {fmt_size(total)}")
+        selected_name = self._sel_file()
+        self._all_files = sorted(files, key=lambda f: f["modified"], reverse=True)
+        self._apply_filter(selected_name=selected_name)
         self._sync_label.setText("✓ Synced")
+
+    def _apply_filter(self, _text=None, selected_name=None):
+        query = self._filter_input.text().strip().lower()
+        if query:
+            self.files = [f for f in self._all_files if query in f["name"].lower()]
+        else:
+            self.files = list(self._all_files)
+        self._render_table(selected_name=selected_name)
+
+    def _render_table(self, selected_name=None):
+        t = self._table
+        t.setRowCount(len(self.files))
+        selected_row = -1
+        for i, f in enumerate(self.files):
+            ni = QTableWidgetItem(f["name"])
+            ni.setForeground(QColor(C["text"]))
+            ni.setData(Qt.UserRole, f["name"])
+
+            si = QTableWidgetItem(fmt_size(f["size"]))
+            si.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            si.setForeground(QColor(C["muted"]))
+
+            mi = QTableWidgetItem(fmt_time(f["modified"]))
+            mi.setTextAlignment(Qt.AlignCenter)
+            mi.setForeground(QColor(C["muted"]))
+
+            t.setItem(i, 0, ni)
+            t.setItem(i, 1, si)
+            t.setItem(i, 2, mi)
+            t.setRowHeight(i, 38)
+            if selected_name and f["name"] == selected_name:
+                selected_row = i
+
+        if selected_row >= 0:
+            t.selectRow(selected_row)
+        else:
+            t.clearSelection()
+
+        shown = len(self.files)
+        total_files = len(self._all_files)
+        total_size = sum(f["size"] for f in self._all_files)
+        if shown == total_files:
+            self._stats_label.setText(
+                f"{total_files} file{'s' if total_files != 1 else ''}  ·  {fmt_size(total_size)}"
+            )
+        else:
+            self._stats_label.setText(
+                f"{shown}/{total_files} shown  ·  {fmt_size(total_size)} total"
+            )
+        self._on_selection_changed()
 
     def _sel_file(self):
         row = self._table.currentRow()
-        return self.files[row]["name"] if row >= 0 else None
+        if row < 0:
+            return None
+        item = self._table.item(row, 0)
+        if not item:
+            return None
+        return item.data(Qt.UserRole)
 
     def _upload(self):
         paths,_ = QFileDialog.getOpenFileNames(self,"Select Files to Upload")
-        for p in paths: self._do_upload(p)
+        for p in paths:
+            self._do_upload(p)
 
     def _do_upload(self, path):
         self._prog_label.setText(f"Uploading: {os.path.basename(path)}")
@@ -1107,17 +1325,21 @@ class ClientDashWidget(QWidget):
         w = UploadWorker(self.server, self.token, path)
         w.progress.connect(self._prog_bar.setValue)
         w.done.connect(lambda ok,m: self._upload_done(ok,m))
-        w.start(); self._workers.append(w)
+        self._track_worker(w)
+        w.start()
 
     def _upload_done(self, ok, msg):
         self._prog_bar.setValue(100)
-        self._prog_label.setText(f"{'✓ Uploaded' if ok else '✗'}: {msg}")
+        self._prog_label.setText(f"{'✓ Uploaded' if ok else '✗ Upload failed'}: {msg}")
         QTimer.singleShot(2500, self._hide_prog)
-        if ok: self._refresh()
+        if ok:
+            self._refresh()
 
     def _download(self):
         name = self._sel_file()
-        if not name: return
+        if not name:
+            self._stats_label.setText("Select a file to download")
+            return
         save,_ = QFileDialog.getSaveFileName(self,"Save As", os.path.basename(name))
         if not save: return
         self._prog_label.setText(f"Downloading: {os.path.basename(name)}")
@@ -1125,7 +1347,8 @@ class ClientDashWidget(QWidget):
         w = DownloadWorker(self.server, self.token, name, save)
         w.progress.connect(self._prog_bar.setValue)
         w.done.connect(lambda ok,m: self._dl_done(ok,m))
-        w.start(); self._workers.append(w)
+        self._track_worker(w)
+        w.start()
 
     def _dl_done(self, ok, msg):
         self._prog_bar.setValue(100)
@@ -1134,16 +1357,20 @@ class ClientDashWidget(QWidget):
 
     def _preview(self):
         name = self._sel_file()
-        if not name: return
+        if not name:
+            self._stats_label.setText("Select a file to preview")
+            return
         self._prev_stack.setCurrentIndex(4)  # loading
         self._prev_filename.setText(f"Loading {os.path.basename(name)}…")
         w = PreviewWorker(self.server, self.token, name)
         w.done.connect(lambda data,mime: self._show_inline(name, data, mime))
         w.error.connect(lambda e: self._show_error(e))
-        w.start(); self._workers.append(w)
+        self._track_worker(w)
+        w.start()
 
     def _show_inline(self, name, data, mime):
         self._last_preview = (name, data, mime)
+        self._pop_btn.setEnabled(True)
         fname = os.path.basename(name)
         self._prev_filename.setText(f"{fname}  ·  {fmt_size(len(data))}")
         is_img  = mime.startswith("image/")
@@ -1166,6 +1393,8 @@ class ClientDashWidget(QWidget):
             self._prev_stack.setCurrentIndex(3)
 
     def _show_error(self, msg):
+        self._last_preview = None
+        self._pop_btn.setEnabled(False)
         self._unsup.setText(f"✗ Preview error:\n{msg}")
         self._prev_stack.setCurrentIndex(3)
 
@@ -1176,15 +1405,19 @@ class ClientDashWidget(QWidget):
 
     def _delete(self):
         name = self._sel_file()
-        if not name: return
+        if not name:
+            self._stats_label.setText("Select a file to delete")
+            return
         r = QMessageBox.question(self,"Confirm",f"Delete '{name}' from server?",
             QMessageBox.Yes|QMessageBox.No)
         if r != QMessageBox.Yes: return
         try:
             resp = _req.delete(f"{self.server}/delete/{name}",
                 headers={"X-Auth-Token":self.token}, timeout=5)
-            if resp.ok: self._refresh()
-            else: self._stats_label.setText("✗ Delete failed")
+            if resp.ok:
+                self._refresh()
+            else:
+                self._stats_label.setText(f"✗ Delete failed (HTTP {resp.status_code})")
         except Exception as e:
             self._stats_label.setText(f"✗ {e}")
 
@@ -1193,6 +1426,8 @@ class ClientDashWidget(QWidget):
 
     def _disconnect(self):
         self._sync_timer.stop()
+        self._last_preview = None
+        self._pop_btn.setEnabled(False)
         try: _req.post(f"{self.server}/logout",
             headers={"X-Auth-Token":self.token}, timeout=3)
         except: pass
@@ -1244,6 +1479,13 @@ class MainWindow(QMainWindow):
         self._stack.removeWidget(w)
         w.deleteLater()
         self.statusBar().showMessage("  Disconnected")
+
+    def closeEvent(self, event):
+        if self._srv_widget._running:
+            self._srv_widget._stop_server()
+            if self._srv_widget._flask_thread:
+                self._srv_widget._flask_thread.wait(2000)
+        super().closeEvent(event)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
