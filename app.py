@@ -575,7 +575,7 @@ class DownloadWorker(QThread):
             total = int(r.headers.get("content-length",0))
             done = 0
             with open(self.sp,"wb") as f:
-                for chunk in r.iter_content(8192):
+                for chunk in r.iter_content(65536):
                     if chunk:
                         f.write(chunk); done+=len(chunk)
                         if total: self.progress.emit(int(done/total*100))
