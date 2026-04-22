@@ -71,3 +71,35 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.executable_path }}
           if-no-files-found: error
+
+  release:
+    # Only run on pushes to main/master — skip for PRs
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # Required to create releases and upload assets
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/            # Each artifact lands in dist/<artifact_name>/
+
+      - name: Rename binaries to include platform suffix
+        run: |
+          mv dist/droplink-linux/app      dist/droplink-linux
+          mv dist/droplink-windows/app.exe dist/droplink-windows.exe
+          mv dist/droplink-macos/app      dist/droplink-macos
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Droplink Build v1.0.${{ github.run_number }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/droplink-linux
+            dist/droplink-windows.exe
+            dist/droplink-macos
