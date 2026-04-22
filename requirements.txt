@@ -1,0 +1,8 @@
+fastapi>=0.111.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9
+zeroconf>=0.132.0
+requests>=2.31.0
+PyQt5>=5.15.0
+bcrypt>=4.1.0
+cryptography>=42.0.0
