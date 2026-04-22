@@ -1288,7 +1288,26 @@ class ClientLoginWidget(QWidget):
 
         discovered_fp = self._selected_discovery_fingerprint()
         stored_fp = _normalize_fingerprint(self._server_fingerprints.get(authority, ""))
-        if discovered_fp and stored_fp and discovered_fp != stored_fp: return self._err.setText("✗  Server identity changed (fingerprint mismatch)")
+        if discovered_fp and stored_fp and discovered_fp != stored_fp:
+            warning_text = (
+                "Server identity has changed.\n\n"
+                f"Old fingerprint:\n{stored_fp}\n\n"
+                f"New fingerprint:\n{discovered_fp}\n\n"
+                "This could indicate a security risk.\n"
+                "Do you want to trust this new server?"
+            )
+            choice = QMessageBox.question(
+                self,
+                "Security Warning",
+                warning_text,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                return self._err.setText("Connection cancelled (untrusted server)")
+            self._server_fingerprints[authority] = discovered_fp
+            self._save_pinned_fingerprints()
+            stored_fp = discovered_fp
 
         pin_to_use, allow_untrusted = stored_fp or discovered_fp, not bool(stored_fp or discovered_fp)
         self._btn.setText("CONNECTING…")
