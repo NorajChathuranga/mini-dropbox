@@ -60,3 +60,10 @@ Choose **SERVER** or **CLIENT** mode when the app starts.
 - Passwords are stored as bcrypt hashes in memory (never plaintext)
 - LAN auto-discovery uses Zeroconf (mDNS/Bonjour) service `_droplink._tcp.local.`
 - The `synced/` folder is created next to `app.py` by default
+---
+
+## 🧱 Build executables for Windows/Linux/macOS
+
+A GitHub Actions workflow is included at `.github/workflows/build-binaries.yml` to build platform-native binaries with PyInstaller on cloud runners.
+
+See `BUILDING.md` for step-by-step instructions.
