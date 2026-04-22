@@ -480,6 +480,7 @@ class UvicornThread(QThread):
             config = uvicorn.Config(
                 _api_app, host="0.0.0.0", port=self.port, access_log=False,
                 log_level="error", ssl_certfile=str(self.cert_file), ssl_keyfile=str(self.key_file),
+                log_config=None,
             )
             self._server = uvicorn.Server(config)
             self._server.run()
