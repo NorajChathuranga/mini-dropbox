@@ -88,9 +88,9 @@ jobs:
 
       - name: Rename binaries to include platform suffix
         run: |
-          mv dist/droplink-linux/app      dist/droplink-linux
-          mv dist/droplink-windows/app.exe dist/droplink-windows.exe
-          mv dist/droplink-macos/app      dist/droplink-macos
+          mv dist/droplink-linux/app       ./droplink-linux
+          mv dist/droplink-windows/app.exe ./droplink-windows.exe
+          mv dist/droplink-macos/app       ./droplink-macos
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -99,7 +99,8 @@ jobs:
           name: Droplink Build v1.0.${{ github.run_number }}
           draft: false
           prerelease: false
+          overwrite: true
           files: |
-            dist/droplink-linux
-            dist/droplink-windows.exe
-            dist/droplink-macos
+            ./droplink-linux
+            ./droplink-windows.exe
+            ./droplink-macos
