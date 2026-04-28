@@ -239,6 +239,24 @@ QSplitter::handle {{ background: transparent; width: 12px; height: 12px; }}
 #  HELPERS & CORE BACKEND
 # ══════════════════════════════════════════════════════════════════════════════
 PREVIEW_SIZE_LIMIT = 50 * 1024 * 1024
+DEBUG_LOG_PATH = "debug-c1042d.log"
+DEBUG_SESSION_ID = "c1042d"
+
+def _debug_log(hypothesis_id: str, location: str, message: str, data: Optional[dict] = None, run_id: str = "initial"):
+    try:
+        payload = {
+            "sessionId": DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
 
 def get_local_ip():
     try:
@@ -476,6 +494,13 @@ class UvicornThread(QThread):
         global _server_ready_callback
         _server_ready_callback = self.started_ok.emit
         try:
+            # region agent log
+            _debug_log("H3", "app.py:UvicornThread.run:start", "Starting uvicorn thread", {
+                "port": self.port,
+                "cert_file": str(self.cert_file),
+                "key_file": str(self.key_file),
+            })
+            # endregion
             _ensure_self_signed_cert(self.cert_file, self.key_file)
             config = uvicorn.Config(
                 _api_app, host="0.0.0.0", port=self.port, access_log=False,
@@ -484,7 +509,11 @@ class UvicornThread(QThread):
             )
             self._server = uvicorn.Server(config)
             self._server.run()
-        except Exception as e: self.failed.emit(str(e))
+        except Exception as e:
+            # region agent log
+            _debug_log("H3", "app.py:UvicornThread.run:exception", "Uvicorn thread failed", {"error": str(e)})
+            # endregion
+            self.failed.emit(str(e))
         finally: _server_ready_callback, self._server = None, None
 
     def stop(self):
@@ -497,6 +526,15 @@ from urllib3.exceptions import InsecureRequestWarning
 urllib3.disable_warnings(InsecureRequestWarning)
 
 def _api_request(method: str, url: str, *, expected_fingerprint: Optional[str] = None, allow_untrusted: bool = False, **kwargs):
+    # region agent log
+    _debug_log("H1", "app.py:_api_request:entry", "API request started", {
+        "method": method,
+        "url": url,
+        "allow_untrusted": allow_untrusted,
+        "has_expected_fingerprint": bool(expected_fingerprint),
+        "timeout": str(kwargs.get("timeout", 5)),
+    })
+    # endregion
     if url.lower().startswith("https://"):
         authority = _authority_key(url)
         raw_timeout = kwargs.get("timeout", 5)
@@ -507,6 +545,15 @@ def _api_request(method: str, url: str, *, expected_fingerprint: Optional[str] =
         provided_fp = _normalize_fingerprint(expected_fingerprint or "")
         pinned_fp   = _normalize_fingerprint(_trusted_server_fingerprints.get(authority, ""))
         required_fp = provided_fp or pinned_fp
+        # region agent log
+        _debug_log("H2", "app.py:_api_request:fingerprint", "TLS fingerprint state", {
+            "authority": authority,
+            "observed_fp_prefix": observed_fp[:12],
+            "provided_fp_prefix": provided_fp[:12],
+            "pinned_fp_prefix": pinned_fp[:12],
+            "required_fp_prefix": required_fp[:12],
+        })
+        # endregion
 
         if required_fp:
             if observed_fp != required_fp: raise RuntimeError("Server certificate fingerprint mismatch.")
@@ -515,6 +562,13 @@ def _api_request(method: str, url: str, *, expected_fingerprint: Optional[str] =
             if not allow_untrusted: raise RuntimeError("Untrusted server certificate. Connect once to pin.")
             _trusted_server_fingerprints[authority] = observed_fp
         kwargs.setdefault("verify", False)
+    # region agent log
+    _debug_log("H5", "app.py:_api_request:dispatch", "Dispatching HTTP request", {
+        "method": method,
+        "url": url,
+        "verify": kwargs.get("verify", None),
+    })
+    # endregion
     return _req.request(method, url, **kwargs)
 
 
@@ -702,15 +756,33 @@ class LoginWorker(QThread):
 
     def run(self):
         try:
+            # region agent log
+            _debug_log("H4", "app.py:LoginWorker.run:entry", "Login worker started", {
+                "server": self.srv,
+                "allow_untrusted": self.allow_untrusted,
+                "pin_fp_prefix": _normalize_fingerprint(self.pin_fp)[:12],
+            })
+            # endregion
             r = _api_request("POST", f"{self.srv}/login", json={"password": self.pw}, timeout=5, expected_fingerprint=self.pin_fp or None, allow_untrusted=self.allow_untrusted)
+            # region agent log
+            _debug_log("H4", "app.py:LoginWorker.run:response", "Login worker received response", {"status_code": r.status_code})
+            # endregion
             if r.status_code == 200:
                 authority = _authority_key(self.srv)
                 learned_fp = _normalize_fingerprint(_trusted_server_fingerprints.get(authority, ""))
                 self.success.emit(self.srv, r.json()["token"], learned_fp)
             elif r.status_code == 403: self.failure.emit("✗  Invalid password")
             else: self.failure.emit(f"✗  Login failed (HTTP {r.status_code})")
-        except RuntimeError as e: self.failure.emit(f"✗  {e}")
-        except Exception as e: self.failure.emit(f"✗  Cannot reach server ({e})")
+        except RuntimeError as e:
+            # region agent log
+            _debug_log("H4", "app.py:LoginWorker.run:runtime_error", "Login worker runtime error", {"error": str(e)})
+            # endregion
+            self.failure.emit(f"✗  {e}")
+        except Exception as e:
+            # region agent log
+            _debug_log("H4", "app.py:LoginWorker.run:exception", "Login worker exception", {"error": str(e)})
+            # endregion
+            self.failure.emit(f"✗  Cannot reach server ({e})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -997,6 +1069,13 @@ class ServerWidget(QWidget):
         except:
             QMessageBox.warning(self, "Error", "Enter a valid port (1–65535).")
             return
+        # region agent log
+        _debug_log("H3", "app.py:ServerWidget._start_server", "Server start requested", {
+            "port": port,
+            "sync_folder": str(SYNC_FOLDER),
+            "password_length": len(pw),
+        })
+        # endregion
 
         with _state_lock:
             _server_state["password_hash"] = _hash_password(pw)
