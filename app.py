@@ -30,13 +30,13 @@ from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QProgressBar, QFileDialog, QMessageBox, QFrame, QHeaderView,
     QStackedWidget, QAbstractItemView, QTextEdit, QSplitter,
-    QScrollArea, QDialog, QComboBox, QSizePolicy
+    QScrollArea, QDialog, QComboBox, QSizePolicy, QShortcut, QGraphicsOpacityEffect
 )
 from PyQt5.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QByteArray, QSettings,
+    Qt, QThread, pyqtSignal, QTimer, QByteArray, QSettings, QEvent, QPropertyAnimation, QEasingCurve
 )
 from PyQt5.QtGui import (
-    QFont, QColor, QPixmap, QTextCursor, QIntValidator,
+    QFont, QColor, QPixmap, QTextCursor, QIntValidator, QKeySequence,
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -62,7 +62,7 @@ C = {
 }
 
 QSS = f"""
-* {{ font-family: 'Segoe UI', 'Consolas', sans-serif; }}
+* {{ font-family: 'Segoe UI Variable', 'Segoe UI', 'Consolas', sans-serif; font-size: 12px; }}
 QMainWindow, QDialog {{ 
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {C['bg_grad1']}, stop:1 {C['bg_grad2']}); 
     color: {C['text']}; 
@@ -71,28 +71,28 @@ QWidget {{ background: transparent; color: {C['text']}; }}
 
 /* Glass Panels */
 QFrame#glass_panel {{
-    background: {C['panel']};
-    border: 1px solid {C['border_s']};
-    border-radius: 16px;
+    background: rgba(22, 32, 48, 0.76);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 18px;
 }}
 QFrame#glass_panel_accent {{
-    background: {C['panel']};
-    border: 1px solid {C['border']};
-    border-radius: 16px;
+    background: rgba(24, 35, 52, 0.8);
+    border: 1px solid rgba(0, 245, 195, 0.3);
+    border-radius: 18px;
 }}
 QFrame#glass_panel_accent:hover {{
-    border: 1px solid rgba(0, 245, 195, 0.5);
-    background: rgba(28, 40, 58, 0.8);
+    border: 1px solid rgba(0, 245, 195, 0.65);
+    background: rgba(30, 44, 64, 0.9);
 }}
 
 QLabel {{ color: {C['text']}; }}
 
 QLineEdit, QComboBox {{
-    background: rgba(10, 15, 25, 0.5);
-    border: 1px solid {C['border_s']};
-    border-radius: 8px;
+    background: rgba(8, 14, 24, 0.62);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 10px;
     color: {C['text']};
-    padding: 10px 14px;
+    padding: 10px 12px;
     font-size: 13px;
 }}
 QLineEdit::placeholder {{ color: {C['dim']}; }}
@@ -112,16 +112,16 @@ QComboBox QAbstractItemView {{
 
 QPushButton {{
     background: {C['card']};
-    border: 1px solid {C['border_s']};
-    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 10px;
     color: {C['text']};
-    padding: 10px 18px;
+    padding: 10px 16px;
     font-size: 12px;
     font-weight: bold;
-    letter-spacing: 1px;
+    letter-spacing: 0.8px;
 }}
-QPushButton:hover {{ background: {C['hover']}; border-color: {C['accent2']}; }}
-QPushButton:pressed {{ background: rgba(0,0,0,0.3); }}
+QPushButton:hover {{ background: rgba(58, 82, 112, 0.88); border-color: {C['accent2']}; }}
+QPushButton:pressed {{ background: rgba(0,0,0,0.4); }}
 QPushButton:disabled {{ color: {C['dim']}; border-color: transparent; background: rgba(20,30,45,0.3); }}
 
 QPushButton#btn_subtle {{
@@ -135,7 +135,7 @@ QPushButton#btn_icon, QPushButton#btn_field {{
     background: transparent;
     border: 1px solid transparent;
     color: {C['muted']};
-    padding: 0;
+    padding: 2px;
     font-size: 14px;
 }}
 QPushButton#btn_icon:hover, QPushButton#btn_field:hover {{ color: {C['accent']}; background: rgba(0, 245, 195, 0.1); border-radius: 8px; }}
@@ -176,7 +176,7 @@ QPushButton#btn_danger {{
 QPushButton#btn_danger:hover {{ background: rgba(255, 77, 106, 0.3); color: #FFF; border-color: #FF4D6A; }}
 
 QTableWidget {{
-    background: transparent;
+    background: rgba(255, 255, 255, 0.015);
     alternate-background-color: rgba(255, 255, 255, 0.02);
     border: none;
     gridline-color: transparent;
@@ -184,14 +184,14 @@ QTableWidget {{
     font-size: 12px;
     outline: none;
 }}
-QTableWidget::item {{ padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.05); }}
+QTableWidget::item {{ padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,0.06); }}
 QTableWidget::item:selected {{ background: rgba(0, 245, 195, 0.15); color: #FFF; border-radius: 4px; }}
 QTableWidget::item:hover {{ background: rgba(255, 255, 255, 0.05); }}
 
 QHeaderView::section {{
     background: transparent;
     color: {C['muted']};
-    padding: 8px 12px;
+    padding: 9px 12px;
     border: none;
     border-bottom: 1px solid {C['border_s']};
     font-size: 10px;
@@ -737,7 +737,7 @@ class LauncherWidget(QWidget):
         icon_lbl.setAlignment(Qt.AlignCenter)
         title_lbl = label("DROPLINK", f"font-size:36px;font-weight:bold;color:{C['accent']};letter-spacing:8px;")
         title_lbl.setAlignment(Qt.AlignCenter)
-        sub_lbl = label("LOCAL FILE SYNC  ·  v2.0", f"font-size:12px;color:{C['muted']};letter-spacing:4px;")
+        sub_lbl = label("LOCAL FILE SYNC  ·  v2.1", f"font-size:12px;color:{C['muted']};letter-spacing:4px;")
         sub_lbl.setAlignment(Qt.AlignCenter)
 
         for w in [icon_lbl, title_lbl, sub_lbl]: wl.addWidget(w)
@@ -805,8 +805,8 @@ class ServerWidget(QWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setSpacing(16)
-        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(18)
+        root.setContentsMargins(22, 22, 22, 22)
 
         # Top bar
         bar = QWidget()
@@ -1339,7 +1339,12 @@ class ClientDashWidget(QWidget):
         self.files, self._all_files, self._workers = [], [], []
         self._fetch_inflight = False
         self._last_preview = None
+        self._btn_fx = {}
+        self._btn_anim = {}
+        self._ext_filter = "All files"
+        self._sort_mode = "Newest first"
         self._build_ui()
+        self._install_shortcuts()
         self._sync_timer = QTimer()
         self._sync_timer.timeout.connect(self._refresh)
         self._sync_timer.start(10000)
@@ -1370,12 +1375,21 @@ class ClientDashWidget(QWidget):
         
         self._refresh_btn = QPushButton("⟳")
         self._refresh_btn.setObjectName("btn_icon")
-        self._refresh_btn.setFixedSize(36, 36)
+        self._refresh_btn.setFixedSize(38, 38)
         self._refresh_btn.clicked.connect(self._refresh)
         bl.addWidget(self._refresh_btn)
         bl.addSpacing(8)
         self._sync_label = label("Syncing…", f"font-size:12px;color:{C['muted']};")
         bl.addWidget(self._sync_label)
+        self._sync_fx = QGraphicsOpacityEffect(self._sync_label)
+        self._sync_label.setGraphicsEffect(self._sync_fx)
+        self._sync_pulse = QPropertyAnimation(self._sync_fx, b"opacity", self)
+        self._sync_pulse.setDuration(1800)
+        self._sync_pulse.setStartValue(0.62)
+        self._sync_pulse.setEndValue(1.0)
+        self._sync_pulse.setEasingCurve(QEasingCurve.InOutQuad)
+        self._sync_pulse.setLoopCount(-1)
+        self._sync_pulse.start()
         root.addWidget(bar)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -1385,8 +1399,8 @@ class ClientDashWidget(QWidget):
         left.setObjectName("glass_panel_accent")
         left.setMinimumWidth(350) 
         ll = QVBoxLayout(left)
-        ll.setSpacing(16)
-        ll.setContentsMargins(20, 20, 20, 20)
+        ll.setSpacing(18)
+        ll.setContentsMargins(22, 22, 22, 22)
 
         # Toolbar responsive
         ar = QHBoxLayout()
@@ -1394,25 +1408,25 @@ class ClientDashWidget(QWidget):
         
         self._upload_btn = QPushButton("↑ UPLOAD")
         self._upload_btn.setObjectName("btn_accent")
-        self._upload_btn.setMinimumHeight(40)
+        self._upload_btn.setMinimumHeight(42)
         self._upload_btn.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         self._upload_btn.clicked.connect(self._upload)
         
         self._dl_btn = QPushButton("↓ DOWNLOAD")
         self._dl_btn.setObjectName("btn_subtle")
-        self._dl_btn.setMinimumHeight(40)
+        self._dl_btn.setMinimumHeight(42)
         self._dl_btn.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         self._dl_btn.clicked.connect(self._download)
         
         self._prev_btn = QPushButton("◉ PREVIEW")
         self._prev_btn.setObjectName("btn_subtle")
-        self._prev_btn.setMinimumHeight(40)
+        self._prev_btn.setMinimumHeight(42)
         self._prev_btn.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         self._prev_btn.clicked.connect(self._preview)
         
         self._del_btn = QPushButton("✕ DELETE")
         self._del_btn.setObjectName("btn_danger")
-        self._del_btn.setMinimumHeight(40)
+        self._del_btn.setMinimumHeight(42)
         self._del_btn.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         self._del_btn.clicked.connect(self._delete)
         
@@ -1427,12 +1441,22 @@ class ClientDashWidget(QWidget):
         self._filter_input = QLineEdit()
         self._filter_input.setPlaceholderText("Filter files by name…")
         self._filter_input.textChanged.connect(self._apply_filter)
+        self._type_filter = QComboBox()
+        self._type_filter.addItems(["All files", "Images", "Documents", "Text/Code", "Archives"])
+        self._type_filter.currentTextChanged.connect(self._on_type_filter_changed)
+        self._type_filter.setMinimumHeight(36)
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItems(["Newest first", "Oldest first", "Name A-Z", "Size largest"])
+        self._sort_combo.currentTextChanged.connect(self._on_sort_mode_changed)
+        self._sort_combo.setMinimumHeight(36)
         clr_flt = QPushButton("CLEAR")
         clr_flt.setObjectName("btn_subtle")
         clr_flt.setMinimumSize(70, 36)
         clr_flt.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         clr_flt.clicked.connect(lambda: self._filter_input.clear())
         flt.addWidget(self._filter_input)
+        flt.addWidget(self._type_filter)
+        flt.addWidget(self._sort_combo)
         flt.addWidget(clr_flt)
         ll.addLayout(flt)
 
@@ -1454,8 +1478,19 @@ class ClientDashWidget(QWidget):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setAcceptDrops(True)
+        self._table.viewport().setAcceptDrops(True)
+        self._table.viewport().installEventFilter(self)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
         self._table.doubleClicked.connect(self._preview)
+        self._table_fx = QGraphicsOpacityEffect(self._table)
+        self._table.setGraphicsEffect(self._table_fx)
+        self._table_fx.setOpacity(1.0)
+        self._table_flash = QPropertyAnimation(self._table_fx, b"opacity", self)
+        self._table_flash.setDuration(140)
+        self._table_flash.setStartValue(0.84)
+        self._table_flash.setEndValue(1.0)
+        self._table_flash.setEasingCurve(QEasingCurve.OutQuad)
         ll.addWidget(self._table)
 
         self._stats_label = label("0 files", f"font-size:12px;color:{C['muted']};")
@@ -1466,8 +1501,8 @@ class ClientDashWidget(QWidget):
         right.setObjectName("glass_panel")
         right.setMinimumWidth(200) # Reduced constraint
         rl = QVBoxLayout(right)
-        rl.setSpacing(16)
-        rl.setContentsMargins(20, 20, 20, 20)
+        rl.setSpacing(18)
+        rl.setContentsMargins(22, 22, 22, 22)
 
         ph = QHBoxLayout()
         ph.addWidget(label("PREVIEW PANEL", f"font-size:11px;color:{C['muted']};letter-spacing:2px;font-weight:bold;"))
@@ -1525,16 +1560,98 @@ class ClientDashWidget(QWidget):
         
         root.addWidget(splitter)
         self._set_action_state(False)
+        self._bind_button_feedback([
+            back, self._refresh_btn, self._upload_btn, self._dl_btn,
+            self._prev_btn, self._del_btn, self._pop_btn, clr_flt
+        ])
+
+    def _install_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+R"), self, activated=self._refresh)
+        QShortcut(QKeySequence("Ctrl+U"), self, activated=self._upload)
+        QShortcut(QKeySequence("Delete"), self, activated=self._delete)
+
+    def _on_type_filter_changed(self, text: str):
+        self._ext_filter = text
+        self._apply_filter(selected_name=self._sel_file())
+
+    def _on_sort_mode_changed(self, text: str):
+        self._sort_mode = text
+        self._apply_filter(selected_name=self._sel_file())
+
+    def _match_type_filter(self, filename: str) -> bool:
+        ext = Path(filename).suffix.lower()
+        if self._ext_filter == "All files":
+            return True
+        if self._ext_filter == "Images":
+            return ext in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg"}
+        if self._ext_filter == "Documents":
+            return ext in {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
+        if self._ext_filter == "Text/Code":
+            return ext in {".txt", ".md", ".json", ".xml", ".csv", ".py", ".js", ".ts", ".html", ".css"}
+        if self._ext_filter == "Archives":
+            return ext in {".zip", ".rar", ".7z", ".tar", ".gz"}
+        return True
+
+    def _sort_files(self, files: list) -> list:
+        if self._sort_mode == "Oldest first":
+            return sorted(files, key=lambda f: f["modified"])
+        if self._sort_mode == "Name A-Z":
+            return sorted(files, key=lambda f: f["name"].lower())
+        if self._sort_mode == "Size largest":
+            return sorted(files, key=lambda f: f["size"], reverse=True)
+        return sorted(files, key=lambda f: f["modified"], reverse=True)
+
+    def eventFilter(self, obj, event):
+        if obj is self._table.viewport():
+            if event.type() == QEvent.DragEnter and event.mimeData().hasUrls():
+                event.acceptProposedAction()
+                return True
+            if event.type() == QEvent.Drop and event.mimeData().hasUrls():
+                local_paths = []
+                for url in event.mimeData().urls():
+                    p = url.toLocalFile()
+                    if p and os.path.isfile(p):
+                        local_paths.append(p)
+                if local_paths:
+                    self._upload_paths(local_paths)
+                    event.acceptProposedAction()
+                return True
+        return super().eventFilter(obj, event)
 
     def _track_worker(self, w: QThread):
         self._workers.append(w)
         w.finished.connect(lambda worker=w: (self._workers.remove(worker) if worker in self._workers else None, worker.deleteLater()))
 
+    def _bind_button_feedback(self, buttons):
+        for btn in buttons:
+            fx = QGraphicsOpacityEffect(btn)
+            fx.setOpacity(1.0)
+            btn.setGraphicsEffect(fx)
+            self._btn_fx[btn] = fx
+            btn.pressed.connect(lambda b=btn: self._animate_button_feedback(b, 0.82))
+            btn.released.connect(lambda b=btn: self._animate_button_feedback(b, 1.0))
+
+    def _animate_button_feedback(self, btn: QPushButton, opacity: float):
+        fx = self._btn_fx.get(btn)
+        if not fx:
+            return
+        anim = QPropertyAnimation(fx, b"opacity", self)
+        anim.setDuration(70 if opacity < 1.0 else 110)
+        anim.setStartValue(fx.opacity())
+        anim.setEndValue(opacity)
+        anim.setEasingCurve(QEasingCurve.OutQuad)
+        self._btn_anim[btn] = anim
+        anim.start()
+
     def _set_action_state(self, has_sel: bool):
         self._dl_btn.setEnabled(has_sel)
         self._prev_btn.setEnabled(has_sel)
         self._del_btn.setEnabled(has_sel)
-    def _on_selection_changed(self): self._set_action_state(self._sel_file() is not None)
+    def _on_selection_changed(self):
+        self._set_action_state(self._sel_file() is not None)
+        if self._table_flash.state() == QPropertyAnimation.Running:
+            self._table_flash.stop()
+        self._table_flash.start()
 
     def _refresh(self):
         if self._fetch_inflight: return
@@ -1550,13 +1667,16 @@ class ClientDashWidget(QWidget):
 
     def _populate(self, files: list):
         selected_name = self._sel_file()
-        self._all_files = sorted(files, key=lambda f: f["modified"], reverse=True)
+        self._all_files = list(files)
         self._apply_filter(selected_name=selected_name)
         self._sync_label.setText("✓ Synced")
 
     def _apply_filter(self, _text=None, selected_name=None):
         query = self._filter_input.text().strip().lower()
-        self.files = [f for f in self._all_files if query in f["name"].lower()] if query else list(self._all_files)
+        filtered = [f for f in self._all_files if self._match_type_filter(f["name"])]
+        if query:
+            filtered = [f for f in filtered if query in f["name"].lower()]
+        self.files = self._sort_files(filtered)
         self._render_table(selected_name=selected_name)
 
     def _render_table(self, selected_name=None):
@@ -1587,7 +1707,12 @@ class ClientDashWidget(QWidget):
 
     def _upload(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Select Files to Upload")
+        self._upload_paths(paths)
+
+    def _upload_paths(self, paths):
         for p in paths:
+            if not os.path.isfile(p):
+                continue
             self._prog_label.setText(f"Uploading: {os.path.basename(p)}")
             self._prog_label.show(); self._prog_bar.setValue(0); self._prog_bar.show()
             w = UploadWorker(self.server, self.token, p)
@@ -1699,10 +1824,11 @@ class PreviewDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Droplink v2")
+        self.setWindowTitle("Droplink v2.1")
         self.resize(1100, 750)
         # FIXED: Enforced a strong global minimum size so panels never squish/clip
         self.setMinimumSize(850, 600) 
+        self._page_anim = None
         
         self._stack = QStackedWidget()
         self._launcher, self._srv_widget, self._cli_login = LauncherWidget(), ServerWidget(), ClientLoginWidget()
@@ -1712,25 +1838,65 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._cli_login)
         self.setCentralWidget(self._stack)
         
-        self._launcher.chose_server.connect(lambda: self._stack.setCurrentIndex(1))
-        self._launcher.chose_client.connect(lambda: self._stack.setCurrentIndex(2))
-        self._srv_widget.go_back.connect(lambda: self._stack.setCurrentIndex(0))
-        self._cli_login.go_back.connect(lambda: self._stack.setCurrentIndex(0))
+        self._launcher.chose_server.connect(lambda: self._switch_page(1))
+        self._launcher.chose_client.connect(lambda: self._switch_page(2))
+        self._srv_widget.go_back.connect(lambda: self._switch_page(0))
+        self._cli_login.go_back.connect(lambda: self._switch_page(0))
         self._cli_login.login_ok.connect(self._on_login)
         
         sb = self.statusBar()
         sb.setStyleSheet(f"background:rgba(0,0,0,0.4);color:{C['muted']};border-top:1px solid rgba(255,255,255,0.05);")
-        sb.showMessage("  Welcome to Droplink v2")
+        sb.showMessage("  Welcome to Droplink v2.1")
+
+    def _switch_page(self, index: int):
+        current = self._stack.currentWidget()
+        if not current or self._stack.currentIndex() == index:
+            self._stack.setCurrentIndex(index)
+            return
+        if self._page_anim and self._page_anim.state() == QPropertyAnimation.Running:
+            self._page_anim.stop()
+        fade_out = QPropertyAnimation(current.graphicsEffect() or QGraphicsOpacityEffect(current), b"opacity", self)
+        if current.graphicsEffect() is None:
+            current.setGraphicsEffect(fade_out.targetObject())
+        fade_out.setDuration(120)
+        fade_out.setStartValue(1.0)
+        fade_out.setEndValue(0.14)
+        fade_out.setEasingCurve(QEasingCurve.InOutQuad)
+
+        def _activate_next():
+            self._stack.setCurrentIndex(index)
+            nxt = self._stack.currentWidget()
+            if not nxt:
+                return
+            fx = QGraphicsOpacityEffect(nxt)
+            nxt.setGraphicsEffect(fx)
+            fade_in = QPropertyAnimation(fx, b"opacity", self)
+            fade_in.setDuration(170)
+            fade_in.setStartValue(0.0)
+            fade_in.setEndValue(1.0)
+            fade_in.setEasingCurve(QEasingCurve.OutQuad)
+
+            def _clear_effect():
+                nxt.setGraphicsEffect(None)
+
+            fade_in.finished.connect(_clear_effect)
+            self._page_anim = fade_in
+            fade_in.start()
+
+        fade_out.finished.connect(_activate_next)
+        self._page_anim = fade_out
+        fade_out.start()
 
     def _on_login(self, server: str, token: str):
         dash = ClientDashWidget(server, token)
         dash.go_back.connect(self._on_client_back)
-        self._stack.addWidget(dash); self._stack.setCurrentWidget(dash)
+        self._stack.addWidget(dash)
+        self._switch_page(self._stack.indexOf(dash))
         self.statusBar().showMessage(f"  Connected to {server}")
 
     def _on_client_back(self):
         w = self._stack.currentWidget()
-        self._stack.setCurrentIndex(2)
+        self._switch_page(2)
         self._stack.removeWidget(w); w.deleteLater()
         self.statusBar().showMessage("  Disconnected")
 
